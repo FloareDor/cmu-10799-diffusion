@@ -237,8 +237,14 @@ def generate_samples(
     if use_ema:
         ema.apply_shadow()
 
-    samples = None
-    # TODO: sample with your method.sample()
+    # Sample with method.sample()
+    num_steps = config.get('sampling', {}).get('num_steps', None)
+    samples = method.sample(
+        batch_size=num_samples,
+        image_shape=image_shape,
+        num_steps=num_steps,
+        **sampling_kwargs,
+    )
 
     if use_ema:
         ema.restore()

@@ -39,7 +39,7 @@ ddpm:
   num_timesteps: 1000
   beta_start: 1.0e-4
   beta_end: 2.0e-2
-  prediction_type: "epsilon"  # options: "epsilon" (predict noise), "x0" (predict clean image), "v" (v-prediction)
+  prediction_type: "x0"  # options: "epsilon" (predict noise), "x0" (predict clean image), "v" (v-prediction)
 
 sampling:
   num_steps: 1000

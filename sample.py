@@ -25,6 +25,7 @@ What you need to implement:
 import os
 import sys
 import argparse
+import math
 from datetime import datetime
 
 import yaml
@@ -32,7 +33,7 @@ import torch
 from tqdm import tqdm
 
 from src.models import create_model_from_config
-from src.data import save_image
+from src.data import save_image, unnormalize
 from src.methods import DDPM
 from src.utils import EMA
 

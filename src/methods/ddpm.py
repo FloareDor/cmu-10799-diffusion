@@ -20,13 +20,19 @@ class DDPM(BaseMethod):
         num_timesteps: int,
         beta_start: float,
         beta_end: float,
-        # TODO: Add your own arguments here
+        prediction_type: str = "epsilon",
     ):
         super().__init__(model, device)
 
         self.num_timesteps = int(num_timesteps)
         self.beta_start = beta_start
         self.beta_end = beta_end
+        self.prediction_type = prediction_type
+        
+        # Validate prediction_type
+        valid_types = ["epsilon", "x0", "v"]
+        if prediction_type not in valid_types:
+            raise ValueError(f"prediction_type must be one of {valid_types}, got {prediction_type}")
 
         # Compute all values as local variables first
         betas = torch.linspace(beta_start, beta_end, num_timesteps)
@@ -59,6 +65,35 @@ class DDPM(BaseMethod):
     # it's a good idea to write a general helper function for that
     
     # =========================================================================
+    # Prediction type conversion helpers
+    # =========================================================================
+    
+    def _predict_x0_from_epsilon(self, x_t: torch.Tensor, t: torch.Tensor, epsilon: torch.Tensor) -> torch.Tensor:
+        """Convert epsilon prediction to x0 prediction."""
+        sqrt_alpha = self.sqrt_alpha_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t][:, None, None, None]
+        return (x_t - sqrt_one_minus_alpha * epsilon) / sqrt_alpha
+    
+    def _predict_epsilon_from_x0(self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+        """Convert x0 prediction to epsilon prediction."""
+        sqrt_alpha = self.sqrt_alpha_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t][:, None, None, None]
+        return (x_t - sqrt_alpha * x0) / sqrt_one_minus_alpha
+    
+    def _predict_epsilon_from_v(self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Convert v-prediction to epsilon prediction."""
+        sqrt_alpha = self.sqrt_alpha_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t][:, None, None, None]
+        return sqrt_alpha * v + sqrt_one_minus_alpha * x_t
+    
+    def _predict_v_from_epsilon(self, x_t: torch.Tensor, t: torch.Tensor, epsilon: torch.Tensor) -> torch.Tensor:
+        """Convert epsilon prediction to v-prediction."""
+        sqrt_alpha = self.sqrt_alpha_cumprod[t][:, None, None, None]
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t][:, None, None, None]
+        x0 = self._predict_x0_from_epsilon(x_t, t, epsilon)
+        return sqrt_alpha * epsilon - sqrt_one_minus_alpha * x0
+    
+    # =========================================================================
     # Forward process
     # =========================================================================
 
@@ -80,7 +115,7 @@ class DDPM(BaseMethod):
 
     def compute_loss(self, x_0: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        TODO: Implement your DDPM loss function here
+        Implement DDPM loss function with support for different prediction types.
 
         Args:
             x_0: Clean data samples of shape (batch_size, channels, height, width)
@@ -91,21 +126,33 @@ class DDPM(BaseMethod):
             metrics: Dictionary of metrics for logging (e.g., {'mse': 0.1})
         """
         batch_size = x_0.shape[0]
-        # fill in the blanks
         t = torch.randint(
             low=0,
             high=self.num_timesteps, 
             size=(batch_size,), 
-            device=self.device # generally good practice to create tensors directly on the GPU
+            device=self.device
         )
         noise = torch.randn_like(x_0)
 
         x_t, _ = self.forward_process(x_0, t, noise)
-        noise_pred = self.model(x_t, t)
+        model_output = self.model(x_t, t)
 
-        loss = F.mse_loss(noise_pred, noise)
+        # Compute target based on prediction_type
+        if self.prediction_type == "epsilon":
+            target = noise
+        elif self.prediction_type == "x0":
+            target = x_0
+        elif self.prediction_type == "v":
+            # v = sqrt(alpha_bar) * epsilon - sqrt(1 - alpha_bar) * x0
+            sqrt_alpha = self.sqrt_alpha_cumprod[t][:, None, None, None]
+            sqrt_one_minus_alpha = self.sqrt_one_minus_alpha_cumprod[t][:, None, None, None]
+            target = sqrt_alpha * noise - sqrt_one_minus_alpha * x_0
+        else:
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
 
-        return loss, {'mse': loss.item()}
+        loss = F.mse_loss(model_output, target)
+
+        return loss, {'loss': loss.item(), 'mse': loss.item()}
 
     # =========================================================================
     # Reverse process (sampling)
@@ -114,7 +161,7 @@ class DDPM(BaseMethod):
     @torch.no_grad()
     def reverse_process(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        TODO: Implement one step of the DDPM reverse process
+        Implement one step of the DDPM reverse process with support for different prediction types.
 
         Args:
             x_t: Noisy samples at time t (batch_size, channels, height, width)
@@ -124,8 +171,17 @@ class DDPM(BaseMethod):
         Returns:
             x_prev: Noisy samples at time t-1 (batch_size, channels, height, width)
         """
-        # prev_image = 1/signal_strength_at_t (current_image - noise_strength_at_t/accumulated_noise * predicted_noise)
-        epsilon = self.model(x_t, t)
+        # Get model output and convert to epsilon
+        model_output = self.model(x_t, t)
+        
+        if self.prediction_type == "epsilon":
+            epsilon = model_output
+        elif self.prediction_type == "x0":
+            epsilon = self._predict_epsilon_from_x0(x_t, t, model_output)
+        elif self.prediction_type == "v":
+            epsilon = self._predict_epsilon_from_v(x_t, t, model_output)
+        else:
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
 
         beta_t = self.betas[t][:, None, None, None]
         alpha_t = self.alphas[t][:, None, None, None]
@@ -139,7 +195,7 @@ class DDPM(BaseMethod):
         noise = sigma_t * z
 
         nonzero_mask = (t>0).float()[:, None, None, None]
-        x_prev = mean + nonzero_mask * noise # dont add noise to the first step cuz that is the final image output lol
+        x_prev = mean + nonzero_mask * noise
         return x_prev
 
     @torch.no_grad()
@@ -147,22 +203,35 @@ class DDPM(BaseMethod):
         self,
         batch_size: int,
         image_shape: Tuple[int, int, int],
-        # TODO: add your arguments here
+        num_steps: Optional[int] = None,
         **kwargs
     ) -> torch.Tensor:
         """
-        TODO: Implement DDPM sampling loop: start from pure noise, iterate through all the time steps using reverse_process()
+        Implement DDPM sampling loop: start from pure noise, iterate through all the time steps using reverse_process()
 
         Args:
             batch_size: Number of samples to generate
             image_shape: Shape of each image (channels, height, width)
-            **kwargs: Additional method-specific arguments (e.g., num_steps)
+            num_steps: Number of sampling steps (default: self.num_timesteps). 
+                       If less than num_timesteps, will skip steps uniformly.
+            **kwargs: Additional method-specific arguments
         Returns:
             samples: Generated samples of shape (batch_size, *image_shape)
         """
         self.model.eval()
+        
+        # Determine timesteps to use
+        if num_steps is None or num_steps == self.num_timesteps:
+            # Use all timesteps
+            timesteps = list(range(self.num_timesteps - 1, -1, -1))
+        else:
+            # Use uniform stride to skip steps
+            # For example: 1000 timesteps with 100 steps = stride of 10
+            stride = self.num_timesteps // num_steps
+            timesteps = list(range(self.num_timesteps - 1, -1, -stride))[:num_steps]
+        
         x_t = torch.randn(batch_size, *image_shape, device=self.device)
-        for timestep in range(self.num_timesteps-1, -1, -1):
+        for timestep in timesteps:
             t = torch.full((batch_size,), timestep, device=self.device, dtype=torch.long)
             x_t = self.reverse_process(x_t, t)
         return x_t
@@ -179,7 +248,7 @@ class DDPM(BaseMethod):
     def state_dict(self) -> Dict:
         state = super().state_dict()
         state["num_timesteps"] = self.num_timesteps
-        # TODO: add other things you want to save
+        state["prediction_type"] = self.prediction_type
         return state
 
     @classmethod
@@ -191,5 +260,5 @@ class DDPM(BaseMethod):
             num_timesteps=ddpm_config["num_timesteps"],
             beta_start=ddpm_config["beta_start"],
             beta_end=ddpm_config["beta_end"],
-            # TODO: add your parameters here
+            prediction_type=ddpm_config.get("prediction_type", "epsilon"),
         )
