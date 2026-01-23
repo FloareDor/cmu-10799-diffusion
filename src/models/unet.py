@@ -86,13 +86,126 @@ class UNet(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.use_scale_shift_norm = use_scale_shift_norm
+
+        # Input and Time
+
+        time_embed_dim = base_channels * 4
+        self.time_embed = TimestepEmbedding(base_channels,time_embed_dim)
+        # 3 channels -> base_channels = 128 channels
+        self.head = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
+
+        # Downsampling
+        self.down_blocks = nn.ModuleList()
+        ch = base_channels # 128
+
+        # We need to remember how many channels were at each step 
+        # so we can combine them later in the Up-Path
+        self.input_block_chans = [base_channels]
+
+        ds = 1 # current downsampling factor (1=32*32)
+
+        # Assume 64x64 input for resolution-based attention
+        current_resolution = 64
         
-        # TODO: build your own unet architecture here
-        # Pro tips: remember to take care of the time embeddings!
+        for level, mult in enumerate(channel_mult):
+            out_ch = base_channels * mult
+
+            for _ in range(num_res_blocks):
+                layers = []
+                resblock = ResBlock(
+                    in_channels=ch, 
+                    out_channels=out_ch, 
+                    time_embed_dim=time_embed_dim,
+                    dropout=dropout,
+                    use_scale_shift_norm=use_scale_shift_norm,
+                )
+                layers.append(resblock)
+
+                ch = out_ch
+                # Check actual resolution (not ds factor) for attention
+                if current_resolution in attention_resolutions:
+                    layers.append(AttentionBlock(channels=out_ch, num_heads=num_heads))
+
+                # Add the combined block to our main list
+                self.down_blocks.append(nn.ModuleList(layers))
+                self.input_block_chans.append(ch)
+            
+            # If this is NOT the last level, we need to downsample (shrink image)
+            if level != len(channel_mult) - 1:
+                self.down_blocks.append(Downsample(ch))
+                self.input_block_chans.append(ch)
+                ds *= 2
+                current_resolution //= 2
+        
+        # =====================================================================
+        # Middle block
+        # =====================================================================
+        self.middle_block = nn.ModuleList([
+            ResBlock(ch, ch, time_embed_dim, dropout, use_scale_shift_norm),
+            AttentionBlock(ch, num_heads),
+            ResBlock(ch, ch, time_embed_dim, dropout, use_scale_shift_norm),
+        ])
+        
+        # =====================================================================
+        # Upsampling path (decoder)
+        # =====================================================================
+        self.up_blocks = nn.ModuleList()
+        
+        # Copy channel list for iteration (we pop from this during construction)
+        up_skip_channels = list(self.input_block_chans)
+        
+        for level in reversed(range(len(channel_mult))):
+            mult = channel_mult[level]
+            out_ch = base_channels * mult
+            
+            # Calculate number of blocks for this level:
+            # - Base: num_res_blocks
+            # - +1 for levels that had a downsample (all except last level)
+            # - +1 for level 0 to consume the head skip connection
+            num_blocks = num_res_blocks
+            if level != len(channel_mult) - 1:
+                num_blocks += 1  # Extra block for downsample skip
+            if level == 0:
+                num_blocks += 1  # Extra block for head skip
+            
+            for i in range(num_blocks):
+                skip_ch = up_skip_channels.pop()
+                
+                layers = []
+                layers.append(
+                    ResBlock(
+                        in_channels=ch + skip_ch,  # Concatenate with skip connection
+                        out_channels=out_ch,
+                        time_embed_dim=time_embed_dim,
+                        dropout=dropout,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                    )
+                )
+                ch = out_ch
+                
+                # Add attention at matching resolutions
+                if current_resolution in attention_resolutions:
+                    layers.append(AttentionBlock(ch, num_heads))
+                
+                # Add upsample at the last block of each level (except level 0)
+                if level != 0 and i == num_blocks - 1:
+                    layers.append(Upsample(ch))
+                    current_resolution *= 2
+                
+                self.up_blocks.append(nn.ModuleList(layers))
+        
+        # =====================================================================
+        # Output
+        # =====================================================================
+        self.out = nn.Sequential(
+            GroupNorm32(32, ch),
+            nn.SiLU(),
+            nn.Conv2d(ch, out_channels, kernel_size=3, padding=1),
+        )
     
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        TODO: Implement the forward pass of the unet
+        Forward pass of the UNet.
         
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
@@ -102,8 +215,58 @@ class UNet(nn.Module):
         Returns:
             Output tensor of shape (batch_size, out_channels, height, width)
         """
-
-        raise NotImplementedError
+        # Compute time embedding
+        t_emb = self.time_embed(t)
+        
+        # Initial convolution
+        h = self.head(x)
+        
+        # =====================================================================
+        # Downsampling path - collect skip connections
+        # =====================================================================
+        skips = [h]
+        for block in self.down_blocks:
+            if isinstance(block, Downsample):
+                h = block(h)
+            else:
+                # It's a ModuleList of [ResBlock, maybe AttentionBlock]
+                for layer in block:
+                    if isinstance(layer, ResBlock):
+                        h = layer(h, t_emb)
+                    else:
+                        h = layer(h)
+            skips.append(h)
+        
+        # =====================================================================
+        # Middle block
+        # =====================================================================
+        for layer in self.middle_block:
+            if isinstance(layer, ResBlock):
+                h = layer(h, t_emb)
+            else:
+                h = layer(h)
+        
+        # =====================================================================
+        # Upsampling path - use skip connections
+        # =====================================================================
+        for block in self.up_blocks:
+            # Concatenate with skip connection
+            skip = skips.pop()
+            h = torch.cat([h, skip], dim=1)
+            
+            # Process through layers in this block
+            for layer in block:
+                if isinstance(layer, ResBlock):
+                    h = layer(h, t_emb)
+                elif isinstance(layer, Upsample):
+                    h = layer(h)
+                else:
+                    h = layer(h)
+        
+        # =====================================================================
+        # Output
+        # =====================================================================
+        return self.out(h)
 
 
 def create_model_from_config(config: dict) -> UNet:

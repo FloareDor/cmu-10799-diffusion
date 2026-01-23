@@ -25,16 +25,24 @@ class DDPM(BaseMethod):
         super().__init__(model, device)
 
         self.num_timesteps = int(num_timesteps)
-        self. beta_start = beta_start
-        self. beta_end = beta_end
+        self.beta_start = beta_start
+        self.beta_end = beta_end
 
+        # Compute all values as local variables first
         betas = torch.linspace(beta_start, beta_end, num_timesteps)
+        alphas = 1.0 - betas
+        alpha_cumprod = torch.cumprod(alphas, dim=0)
+        sqrt_alpha_cumprod = torch.sqrt(alpha_cumprod)
+        sqrt_one_minus_alpha_cumprod = torch.sqrt(1.0 - alpha_cumprod)
+        
+        # Register ALL of them as buffers
+        # Use persistent=False if you don't want to save them in the checkpoint 
+        # (since they can be recalculated), but standard practice is often just to register them.
         self.register_buffer('betas', betas)
-        self.alphas = 1.0 - betas
-        self.alpha_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.sqrt_alpha_cumprod = torch.sqrt(self.alpha_cumprod)
-        self.sqrt_one_minus_alpha_cumprod = torch.sqrt(1.0 - self.alpha_cumprod)
-        # TODO: Implement your own init
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alpha_cumprod', alpha_cumprod)
+        self.register_buffer('sqrt_alpha_cumprod', sqrt_alpha_cumprod)
+        self.register_buffer('sqrt_one_minus_alpha_cumprod', sqrt_one_minus_alpha_cumprod)
 
     # =========================================================================
     # You can add, delete or modify as many functions as you would like
@@ -56,7 +64,7 @@ class DDPM(BaseMethod):
         if noise is None:
             noise = torch.randn_like(x_0)
         
-        sqrt_alpha_t = self.sqrt_alpa_cumprod[t][:, None, None, None]
+        sqrt_alpha_t = self.sqrt_alpha_cumprod[t][:, None, None, None]
         sqrt_one_minus_alpha_t = self.sqrt_one_minus_alpha_cumprod[t][:, None, None, None]
 
         # x_t = signal_strength_at_t*x_0 + noise_strength_at_t*noise
