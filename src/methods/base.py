@@ -94,7 +94,7 @@ class BaseMethod(nn.Module, ABC):
         Returns:
             self for chaining
         """
-        self.model = self.model.to(device)
+        super().to(device)  # Move all registered buffers and submodules
         self.device = device
         return self
     

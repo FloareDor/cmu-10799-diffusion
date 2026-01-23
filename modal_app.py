@@ -8,6 +8,7 @@ See docs/QUICKSTART-MODAL.md for setup and usage instructions.
 All parameters are read from config YAML files first, then overridden by command-line arguments.
 """
 
+import time
 import modal
 
 # =============================================================================
@@ -22,6 +23,7 @@ app = modal.App("cmu-10799-diffusion")
 # but installs GPU-enabled PyTorch automatically on Modal's GPU machines
 image = (
     modal.Image.debian_slim(python_version="3.11")
+    .env({"CACHE_BUST4": str(time.time())})  # Forces rebuild every time - remove when done developing
     .pip_install(
         "torch>=2.0.0",
         "torchvision>=0.15.0",

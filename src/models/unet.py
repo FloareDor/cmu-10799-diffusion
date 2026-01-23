@@ -90,7 +90,7 @@ class UNet(nn.Module):
         # Input and Time
 
         time_embed_dim = base_channels * 4
-        self.time_embed = TimestepEmbedding(base_channels,time_embed_dim)
+        self.time_embed = TimestepEmbedding(time_embed_dim)
         # 3 channels -> base_channels = 128 channels
         self.head = nn.Conv2d(in_channels, base_channels, kernel_size=3, padding=1)
 
@@ -159,14 +159,10 @@ class UNet(nn.Module):
             out_ch = base_channels * mult
             
             # Calculate number of blocks for this level:
-            # - Base: num_res_blocks
-            # - +1 for levels that had a downsample (all except last level)
-            # - +1 for level 0 to consume the head skip connection
-            num_blocks = num_res_blocks
-            if level != len(channel_mult) - 1:
-                num_blocks += 1  # Extra block for downsample skip
-            if level == 0:
-                num_blocks += 1  # Extra block for head skip
+            # Each level needs num_res_blocks + 1 to consume:
+            # - num_res_blocks resblock skips from the same encoder level
+            # - 1 additional skip (downsample from previous encoder level, or head for level 0)
+            num_blocks = num_res_blocks + 1
             
             for i in range(num_blocks):
                 skip_ch = up_skip_channels.pop()

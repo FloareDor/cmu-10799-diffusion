@@ -44,6 +44,9 @@ class DDPM(BaseMethod):
         self.register_buffer('sqrt_alpha_cumprod', sqrt_alpha_cumprod)
         self.register_buffer('sqrt_one_minus_alpha_cumprod', sqrt_one_minus_alpha_cumprod)
 
+        # Move all buffers to the correct device
+        self.to(device)
+
     # =========================================================================
     # You can add, delete or modify as many functions as you would like
     # =========================================================================
