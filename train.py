@@ -261,7 +261,13 @@ def save_samples(
         num_samples: Number of samples, used to calculate grid layout.
     """
 
-    raise NotImplementedError
+    # 1. Unnormalize samples from [-1, 1] to [0, 1]
+    samples = unnormalize(samples)
+    
+    # 2. Save using the imported save_image utility
+    # nrow calculation makes a nice square grid (e.g. 64 samples -> 8x8 grid)
+    nrow = int(math.sqrt(num_samples))
+    save_image(samples, save_path, nrow=nrow)
 
 
 def train(
