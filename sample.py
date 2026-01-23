@@ -171,7 +171,7 @@ def main():
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples, img_path, 1)
+                    save_samples(samples[i:i+1], img_path, 1)
                     sample_idx += 1
 
             remaining -= batch_size
