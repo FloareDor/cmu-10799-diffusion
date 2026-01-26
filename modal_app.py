@@ -221,7 +221,11 @@ def sample(
     checkpoint_path = f"/data/{checkpoint}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"/data/samples/{method}_{timestamp}.png"
-
+    # Include num_steps in filename to avoid collisions when running multiple jobs in parallel
+    if num_steps is not None:
+        output_path = f"/data/samples/{method}_{num_steps}steps_{timestamp}.png"
+    else:
+        output_path = f"/data/samples/{method}_{timestamp}.png"
     os.makedirs("/data/samples", exist_ok=True)
 
     # Build command to run sample.py
@@ -299,6 +303,7 @@ def evaluate_torch_fidelity(
     batch_size: int = 128,
     num_steps: int = None,
     override: bool = False,
+    save_log_path: str = None,
 ):
     """
     Evaluate using torch-fidelity CLI.
@@ -313,6 +318,7 @@ def evaluate_torch_fidelity(
         batch_size: Batch size
         num_steps: Sampling steps (optional)
         override: Force regenerate samples even if they exist
+        save_log_path: Optional path to save results log file (relative to /data)
     """
     import sys
     import subprocess
@@ -323,8 +329,14 @@ def evaluate_torch_fidelity(
 
     # Put samples in same parent dir as checkpoint under samples/
     checkpoint_dir = Path(checkpoint_path).parent
-    generated_dir = str(checkpoint_dir / "samples" / "generated")
-    cache_dir = str(checkpoint_dir / "samples" / "cache")
+    
+    # --- CRITICAL FIX: Unique folders for parallel execution ---
+    # Append step count to folder name so jobs don't overwrite each other
+    folder_suffix = f"_{num_steps}steps" if num_steps else ""
+    
+    generated_dir = str(checkpoint_dir / "samples" / f"generated{folder_suffix}")
+    cache_dir = str(checkpoint_dir / "samples" / f"cache{folder_suffix}")
+    # -----------------------------------------------------------
 
     # Prepare dataset path for torch-fidelity
     # torch-fidelity needs actual image files, not Arrow format
@@ -438,6 +450,21 @@ def evaluate_torch_fidelity(
 
     try:
         result = subprocess.run(fidelity_cmd, check=True, capture_output=True, text=True)
+
+        # Save results to log file if path provided
+        if save_log_path:
+            log_path = f"/data/{save_log_path}"
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'w') as f:
+                f.write(f"# Evaluation Results\n")
+                f.write(f"# Method: {method}\n")
+                f.write(f"# Checkpoint: {checkpoint}\n")
+                f.write(f"# Num Steps: {num_steps}\n")
+                f.write(f"# Num Samples: {num_samples}\n")
+                f.write(f"# Metrics: {metrics}\n\n")
+                f.write(result.stdout)
+            print(f"Results saved to {log_path}")
+
         volume.commit()
         return result.stdout
     except subprocess.CalledProcessError as e:
@@ -450,6 +477,36 @@ def evaluate_torch_fidelity(
         if e.stderr:
             print(f"\nStderr:\n{e.stderr}")
         raise
+
+
+# =============================================================================
+# Helper Functions for Logging
+# =============================================================================
+
+@app.function(
+    image=image,
+    timeout=60 * 5,
+    volumes={"/data": volume},
+)
+def save_summary_log(log_path: str, content: str):
+    """
+    Save a summary log file to the Modal volume.
+
+    Args:
+        log_path: Path relative to /data (e.g., "q7_ablation/summary.txt")
+        content: Content to write to the file
+    """
+    import os
+
+    full_path = f"/data/{log_path}"
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+
+    with open(full_path, 'w') as f:
+        f.write(content)
+
+    volume.commit()
+    print(f"Summary saved to {full_path}")
+    return full_path
 
 
 # =============================================================================
@@ -545,3 +602,125 @@ def main(
     else:
         print(f"Unknown action: {action}")
         print("Valid actions: download, train, sample, evaluate")
+
+
+@app.local_entrypoint()
+def run_q7_ablation(
+    checkpoint: str = "logs/ddpm_modal/ddpm_20260123_090933/checkpoints/ddpm_final.pt",
+    steps_list: str = "100,300,500,700,900,1000",
+):
+    """.
+    Q7: Sampling Steps Ablation Study using Modal Batch Processing.
+    """
+    # Parse steps list
+    steps_list_parsed = [int(s.strip()) for s in steps_list.split(",")]
+    
+    print(f"\n--- Q7: Sampling Steps Ablation Study ---")
+    print(f"Testing: {steps_list_parsed} steps")
+    print(f"Checkpoint: {checkpoint}\n")
+
+    # ============================================================================
+    # Part 1: KID Evaluations (1000 samples each)
+    # ============================================================================
+    print(f"--- Part 1: KID Evaluations (1000 samples each) ---")
+    print("🚀 Launching KID evaluation jobs...")
+
+    kid_handles = []
+    for steps in steps_list_parsed:
+        # We use .spawn() instead of .spawn_map() so we can pass keyword arguments
+        # .spawn() returns a handle that we can wait on
+        handle = evaluate_torch_fidelity.spawn(
+            method="ddpm",
+            checkpoint=checkpoint,
+            metrics="kid",
+            num_samples=1000,
+            num_steps=steps,
+            save_log_path=f"q7_ablation/kid_{steps}steps.txt",
+        )
+        kid_handles.append((steps, handle))
+
+    print(f"✅ Submitted {len(steps_list_parsed)} KID evaluation jobs!")
+    print("⏳ Waiting for results...\n")
+
+    # Wait for all jobs and collect results
+    kid_results = {}
+    for steps, handle in kid_handles:
+        print(f"\n{'='*60}")
+        print(f"Results for {steps} steps:")
+        print(f"{'='*60}")
+        try:
+            result = handle.get()
+            print(result)
+            kid_results[steps] = result
+        except Exception as e:
+            print(f"❌ Error for {steps} steps: {e}")
+            kid_results[steps] = f"ERROR: {e}"
+
+    # ============================================================================
+    # Part 2: Qualitative Samples (1 sample per step count)
+    # ============================================================================
+    print(f"\n--- Part 2: Qualitative Samples (1 sample per step count) ---")
+    print("🖼️  Launching sample generation jobs...")
+
+    sample_handles = []
+    for steps in steps_list_parsed:
+        handle = sample.spawn(
+            method="ddpm",
+            checkpoint=checkpoint,
+            num_samples=1,
+            num_steps=steps,
+        )
+        sample_handles.append((steps, handle))
+
+    print(f"✅ Submitted {len(steps_list_parsed)} sample generation jobs!")
+    print("⏳ Waiting for sample generation to complete...\n")
+
+    # Wait for all sample jobs
+    for steps, handle in sample_handles:
+        try:
+            result = handle.get()
+            print(f"✅ {steps} steps: {result}")
+        except Exception as e:
+            print(f"❌ Error generating sample for {steps} steps: {e}")
+
+    # ============================================================================
+    # Summary - Save consolidated log file
+    # ============================================================================
+    print("\n📊 Summary:")
+    print(f"  - KID evaluations: {len(steps_list_parsed)} jobs (1000 samples each)")
+    print(f"  - Qualitative samples: {len(steps_list_parsed)} jobs (1 sample each)")
+
+    # Build consolidated summary content
+    from datetime import datetime
+    summary_lines = [
+        "=" * 60,
+        "Q7 Sampling Steps Ablation Study - KID Results Summary",
+        "=" * 60,
+        f"Checkpoint: {checkpoint}",
+        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Steps tested: {steps_list_parsed}",
+        "",
+        "-" * 60,
+        "KID Scores by Step Count:",
+        "-" * 60,
+        "",
+    ]
+
+    for steps in steps_list_parsed:
+        summary_lines.append(f"--- {steps} steps ---")
+        if steps in kid_results:
+            summary_lines.append(kid_results[steps])
+        else:
+            summary_lines.append("No result recorded")
+        summary_lines.append("")
+
+    summary_content = "\n".join(summary_lines)
+
+    # Save summary to volume
+    print("\n📝 Saving consolidated summary log...")
+    save_summary_log.remote("q7_ablation/kid_summary.txt", summary_content)
+
+    print(f"\n✅ All jobs completed!")
+    print(f"📁 Logs saved to /data/q7_ablation/ on Modal volume")
+    print(f"   - Individual logs: kid_<steps>steps.txt")
+    print(f"   - Summary: kid_summary.txt")
