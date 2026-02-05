@@ -199,21 +199,72 @@ class DDPM(BaseMethod):
         return x_prev
 
     @torch.no_grad()
+    def ddim_reverse_process(
+        self, 
+        x_t: torch.Tensor, 
+        t: torch.Tensor, 
+        t_prev: torch.Tensor,
+        eta: float = 0.0
+    ) -> torch.Tensor:
+        """
+        Implement one step of the DDIM reverse process.
+        
+        Args:
+            x_t: Noisy samples at time t
+            t: Current timestep index
+            t_prev: Previous timestep index (can be t-1 or earlier)
+            eta: Coefficient for noise (0.0 for deterministic DDIM)
+        """
+        model_output = self.model(x_t, t)
+        
+        if self.prediction_type == "epsilon":
+            epsilon = model_output
+        elif self.prediction_type == "x0":
+            epsilon = self._predict_epsilon_from_x0(x_t, t, model_output)
+        elif self.prediction_type == "v":
+            epsilon = self._predict_epsilon_from_v(x_t, t, model_output)
+        else:
+            raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+
+        alpha_bar_t = self.alpha_cumprod[t][:, None, None, None]
+        alpha_bar_t_prev = self.alpha_cumprod[t_prev][:, None, None, None] if t_prev >= 0 else torch.ones_like(alpha_bar_t)
+
+        # 1. Estimate x0
+        x0_hat = (x_t - torch.sqrt(1 - alpha_bar_t) * epsilon) / torch.sqrt(alpha_bar_t)
+        
+        # 2. Compute sigma_t (noise level)
+        # sigma_t = eta * sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t)) * sqrt(1 - alpha_bar_t / alpha_bar_prev)
+        sigma_t = eta * torch.sqrt((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * torch.sqrt(1 - alpha_bar_t / alpha_bar_t_prev)
+        
+        # 3. Direction pointing to x_t
+        dir_xt = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * epsilon
+        
+        # 4. Random noise
+        noise = sigma_t * torch.randn_like(x_t) if eta > 0 else 0
+        
+        x_prev = torch.sqrt(alpha_bar_t_prev) * x0_hat + dir_xt + noise
+        
+        return x_prev
+
+    @torch.no_grad()
     def sample(
         self,
         batch_size: int,
         image_shape: Tuple[int, int, int],
         num_steps: Optional[int] = None,
+        method: Literal["ddpm", "ddim"] = "ddpm",
+        eta: float = 0.0,
         **kwargs
     ) -> torch.Tensor:
         """
-        Implement DDPM sampling loop: start from pure noise, iterate through all the time steps using reverse_process()
+        Implement DDPM/DDIM sampling loop.
 
         Args:
             batch_size: Number of samples to generate
             image_shape: Shape of each image (channels, height, width)
-            num_steps: Number of sampling steps (default: self.num_timesteps). 
-                       If less than num_timesteps, will skip steps uniformly.
+            num_steps: Number of sampling steps.
+            method: Sampling method ('ddpm' or 'ddim')
+            eta: Noise coefficient for DDIM (default 0.0)
             **kwargs: Additional method-specific arguments
         Returns:
             samples: Generated samples of shape (batch_size, *image_shape)
@@ -222,18 +273,26 @@ class DDPM(BaseMethod):
         
         # Determine timesteps to use
         if num_steps is None or num_steps == self.num_timesteps:
-            # Use all timesteps
             timesteps = list(range(self.num_timesteps - 1, -1, -1))
         else:
             # Use uniform stride to skip steps
-            # For example: 1000 timesteps with 100 steps = stride of 10
-            stride = self.num_timesteps // num_steps
-            timesteps = list(range(self.num_timesteps - 1, -1, -stride))[:num_steps]
+            # Example: 1000 steps, num_steps=100 => steps 999, 989, ..., 9
+            indices = torch.linspace(self.num_timesteps - 1, 0, num_steps).long().tolist()
+            timesteps = indices
         
         x_t = torch.randn(batch_size, *image_shape, device=self.device)
-        for timestep in timesteps:
+        
+        for i, timestep in enumerate(timesteps):
             t = torch.full((batch_size,), timestep, device=self.device, dtype=torch.long)
-            x_t = self.reverse_process(x_t, t)
+            
+            if method == "ddpm":
+                x_t = self.reverse_process(x_t, t)
+            else:
+                # Get previous timestep in the sequence
+                prev_timestep = timesteps[i + 1] if i + 1 < len(timesteps) else -1
+                t_prev = torch.full((batch_size,), prev_timestep, device=self.device, dtype=torch.long)
+                x_t = self.ddim_reverse_process(x_t, t, t_prev, eta=eta)
+                
         return x_t
 
     # =========================================================================

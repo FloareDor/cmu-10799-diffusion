@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 from src.models import create_model_from_config
 from src.data import save_image, unnormalize
-from src.methods import DDPM
+from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
 
@@ -79,8 +79,8 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     parser.add_argument('--method', type=str, required=True,
-                       choices=['ddpm'], # You can add more later
-                       help='Method used for training (currently only ddpm is supported)')
+                       choices=['ddpm', 'flow_matching'],
+                       help='Method used for training (ddpm or flow_matching)')
     parser.add_argument('--num_samples', type=int, default=64,
                        help='Number of samples to generate')
     parser.add_argument('--output_dir', type=str, default='samples',
@@ -97,6 +97,11 @@ def main():
     # Sampling arguments
     parser.add_argument('--num_steps', type=int, default=None,
                        help='Number of sampling steps (default: from config)')
+    parser.add_argument('--sampler', type=str, default='ddpm',
+                       choices=['ddpm', 'ddim'],
+                       help='Sampler to use (only for ddpm method)')
+    parser.add_argument('--eta', type=float, default=0.0,
+                       help='Eta parameter for DDIM (default: 0.0)')
     
     # Other options
     parser.add_argument('--no_ema', action='store_true',
@@ -123,8 +128,10 @@ def main():
     # Create method
     if args.method == 'ddpm':
         method = DDPM.from_config(model, config, device)
+    elif args.method == 'flow_matching':
+        method = FlowMatching.from_config(model, config, device)
     else:
-        raise ValueError(f"Unknown method: {args.method}. Only 'ddpm' is currently supported.")
+        raise ValueError(f"Unknown method: {args.method}. Only 'ddpm' and 'flow_matching' are currently supported.")
     
     # Apply EMA weights
     if not args.no_ema:
@@ -161,7 +168,8 @@ def main():
                 batch_size=batch_size,
                 image_shape=image_shape,
                 num_steps=num_steps,
-                # TODO: add your arugments here
+                method=args.sampler,
+                eta=args.eta,
             )
 
             # Save individual images immediately or collect for grid

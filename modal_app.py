@@ -207,6 +207,8 @@ def sample(
     checkpoint: str = "checkpoints/ddpm/ddpm_final.pt",
     num_samples: int = None,
     num_steps: int = None,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
 ):
     """
     Generate samples from a trained model.
@@ -223,9 +225,9 @@ def sample(
     output_path = f"/data/samples/{method}_{timestamp}.png"
     # Include num_steps in filename to avoid collisions when running multiple jobs in parallel
     if num_steps is not None:
-        output_path = f"/data/samples/{method}_{num_steps}steps_{timestamp}.png"
+        output_path = f"/data/samples/{method}_{num_steps}steps_{sampler}_{timestamp}.png"
     else:
-        output_path = f"/data/samples/{method}_{timestamp}.png"
+        output_path = f"/data/samples/{method}_{sampler}_{timestamp}.png"
     os.makedirs("/data/samples", exist_ok=True)
 
     # Build command to run sample.py
@@ -235,6 +237,8 @@ def sample(
         "--method", method,
         "--grid",
         "--output", output_path,
+        "--sampler", sampler,
+        "--eta", str(eta),
     ]
 
     if num_samples is not None:
@@ -524,6 +528,8 @@ def main(
     learning_rate: float = None,
     num_samples: int = None,
     num_steps: int = None,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
     metrics: str = None,
     overfit_single_batch: bool = False,
     override: bool = False,
@@ -572,12 +578,22 @@ def main(
     elif action == "sample":
         if checkpoint is None:
             checkpoint = f"checkpoints/{method}/{method}_final.pt"
-        result = sample.remote(
-            method=method,
-            checkpoint=checkpoint,
-            num_samples=num_samples,
-            num_steps=num_steps,
-        )
+        
+        sample_kwargs = {
+            'method': method,
+            'checkpoint': checkpoint,
+            'num_samples': num_samples,
+            'num_steps': num_steps,
+        }
+        
+        # Add optional sampler and eta if they exist in locals or are passed
+        # Note: the main function signature needs to include them
+        if 'sampler' in locals() and sampler is not None:
+            sample_kwargs['sampler'] = sampler
+        if 'eta' in locals() and eta is not None:
+            sample_kwargs['eta'] = eta
+
+        result = sample.remote(**sample_kwargs)
         print(result)
     elif action == "evaluate" or action == "evaluate_torch_fidelity":
         if checkpoint is None:

@@ -1,0 +1,57 @@
+data:
+  dataset: "celeba"
+  root: "/data/celeba"
+  from_hub: true
+  repo_name: "electronickale/cmu-10799-celeba64-subset"
+  image_size: 64
+  channels: 3
+  num_workers: 4
+  pin_memory: true
+  augment: true
+
+model:
+  base_channels: 128
+  channel_mult: [1, 2, 2, 4]
+  num_res_blocks: 2
+  attention_resolutions: [16]
+  num_heads: 4
+  dropout: 0.0
+  use_scale_shift_norm: true
+
+training:
+  batch_size: 64
+  learning_rate: 0.0002
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  ema_decay: 0.9999
+  ema_start: 5000
+  gradient_clip_norm: 1.0
+  num_iterations: 120000
+  log_every: 100
+  sample_every: 5000
+  save_every: 10000
+  num_samples: 16
+
+flow_matching:
+  num_timesteps: 1000
+
+sampling:
+  num_steps: 50 # Flow Matching can sample in fewer steps than DDPM!
+
+infrastructure:
+  seed: 42
+  device: "cuda"
+  num_gpus: 1
+  mixed_precision: false
+  compile_model: false
+
+checkpoint:
+  dir: "./checkpoints"
+  resume: null
+
+logging:
+  dir: "./logs"
+  wandb:
+    enabled: true
+    project: "cmu-10799-diffusion"
+    entity: null
