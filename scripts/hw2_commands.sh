@@ -7,7 +7,7 @@
 # --- 1. TRIAL RUNS (Smoke Tests) ---
 # Use these to ensure code doesn't crash before leaving it overnight
 # modal run --detach modal_app.py::main --action train --method flow_matching --config configs/flow_matching_modal.yaml --iterations 50 --overfit-single-batch
-# modal run modal_app.py::train_1gpu --action train --method ddpm --config configs/ddpm_modal.yaml --iterations 50 --overfit-single-batch
+# modal run --detach modal_app.py::train_1gpu --action train --method ddpm --config configs/ddpm_modal.yaml --iterations 50 --overfit-single-batch
 
 # --- 2. MAIN TRAINING (OVERNIGHT) ---
 # Launch and detach. Check status via Modal dashboard.
@@ -28,10 +28,10 @@ modal run --detach modal_app.py::main --action train --method flow_matching --co
 # --- 4. QUALITATIVE COMPARISONS ---
 
 # Flow Matching Samples (Euler 50 steps)
-# modal run modal_app.py::main --action sample --method flow_matching --checkpoint checkpoints/flow_matching_modal/flow_matching_final.pt --num_steps 50
+# modal run --detach modal_app.py::main --action sample --method flow_matching --checkpoint checkpoints/flow_matching_modal/flow_matching_final.pt --num_steps 50
 
 # DDIM Deterministic (100 steps)
-# modal run modal_app.py::main --action sample --method ddpm --checkpoint checkpoints/ddpm_modal/ddpm_final.pt --sampler ddim --num_steps 100
+# modal run --detach modal_app.py::main --action sample --method ddpm --checkpoint checkpoints/ddpm_modal/ddpm_final.pt --sampler ddim --num_steps 100
 
 # DDPM Stochastic (100 steps)
-# modal run modal_app.py::main --action sample --method ddpm --checkpoint checkpoints/ddpm_modal/ddpm_final.pt --sampler ddpm --num_steps 100
+# modal run --detach modal_app.py::main --action sample --method ddpm --checkpoint checkpoints/ddpm_modal/ddpm_final.pt --sampler ddpm --num_steps 100

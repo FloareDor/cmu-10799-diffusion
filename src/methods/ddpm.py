@@ -227,7 +227,11 @@ class DDPM(BaseMethod):
             raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
 
         alpha_bar_t = self.alpha_cumprod[t][:, None, None, None]
-        alpha_bar_t_prev = self.alpha_cumprod[t_prev][:, None, None, None] if t_prev >= 0 else torch.ones_like(alpha_bar_t)
+        # t_prev can contain -1 for the terminal step; handle per-sample safely.
+        alpha_bar_t_prev = torch.ones_like(alpha_bar_t)
+        valid_prev_mask = t_prev >= 0
+        if valid_prev_mask.any():
+            alpha_bar_t_prev[valid_prev_mask] = self.alpha_cumprod[t_prev[valid_prev_mask]][:, None, None, None]
 
         # 1. Estimate x0
         x0_hat = (x_t - torch.sqrt(1 - alpha_bar_t) * epsilon) / torch.sqrt(alpha_bar_t)

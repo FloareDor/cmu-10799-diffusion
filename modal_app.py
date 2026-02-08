@@ -209,6 +209,7 @@ def sample(
     num_steps: int = None,
     sampler: str = "ddpm",
     eta: float = 0.0,
+    save_path: str = None,
 ):
     """
     Generate samples from a trained model.
@@ -221,14 +222,17 @@ def sample(
 
     # Set up paths
     checkpoint_path = f"/data/{checkpoint}"
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"/data/samples/{method}_{timestamp}.png"
-    # Include num_steps in filename to avoid collisions when running multiple jobs in parallel
-    if num_steps is not None:
-        output_path = f"/data/samples/{method}_{num_steps}steps_{sampler}_{timestamp}.png"
+    if save_path is not None:
+        output_path = f"/data/{save_path}"
     else:
-        output_path = f"/data/samples/{method}_{sampler}_{timestamp}.png"
-    os.makedirs("/data/samples", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"/data/samples/{method}_{timestamp}.png"
+        # Include num_steps in filename to avoid collisions when running multiple jobs in parallel
+        if num_steps is not None:
+            output_path = f"/data/samples/{method}_{num_steps}steps_{sampler}_{timestamp}.png"
+        else:
+            output_path = f"/data/samples/{method}_{sampler}_{timestamp}.png"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # Build command to run sample.py
     cmd = [
@@ -306,6 +310,8 @@ def evaluate_torch_fidelity(
     num_samples: int = 5000,
     batch_size: int = 128,
     num_steps: int = None,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
     override: bool = False,
     save_log_path: str = None,
 ):
@@ -321,6 +327,8 @@ def evaluate_torch_fidelity(
         num_samples: Number of samples to generate
         batch_size: Batch size
         num_steps: Sampling steps (optional)
+        sampler: Sampling method for DDPM ('ddpm' or 'ddim')
+        eta: Eta parameter for DDIM sampling
         override: Force regenerate samples even if they exist
         save_log_path: Optional path to save results log file (relative to /data)
     """
@@ -334,9 +342,13 @@ def evaluate_torch_fidelity(
     # Put samples in same parent dir as checkpoint under samples/
     checkpoint_dir = Path(checkpoint_path).parent
     
-    # --- CRITICAL FIX: Unique folders for parallel execution ---
-    # Append step count to folder name so jobs don't overwrite each other
-    folder_suffix = f"_{num_steps}steps" if num_steps else ""
+    # Include sampling config in folder names so different samplers/steps do not collide
+    folder_parts = []
+    if num_steps:
+        folder_parts.append(f"{num_steps}steps")
+    if sampler:
+        folder_parts.append(sampler)
+    folder_suffix = f"_{'_'.join(folder_parts)}" if folder_parts else ""
     
     generated_dir = str(checkpoint_dir / "samples" / f"generated{folder_suffix}")
     cache_dir = str(checkpoint_dir / "samples" / f"cache{folder_suffix}")
@@ -417,6 +429,8 @@ def evaluate_torch_fidelity(
             "--output_dir", generated_dir,
             "--num_samples", str(num_samples),
             "--batch_size", str(batch_size),
+            "--sampler", sampler,
+            "--eta", str(eta),
         ]
 
         if num_steps:
@@ -464,6 +478,8 @@ def evaluate_torch_fidelity(
                 f.write(f"# Method: {method}\n")
                 f.write(f"# Checkpoint: {checkpoint}\n")
                 f.write(f"# Num Steps: {num_steps}\n")
+                f.write(f"# Sampler: {sampler}\n")
+                f.write(f"# Eta: {eta}\n")
                 f.write(f"# Num Samples: {num_samples}\n")
                 f.write(f"# Metrics: {metrics}\n\n")
                 f.write(result.stdout)
@@ -530,7 +546,9 @@ def main(
     num_steps: int = None,
     sampler: str = "ddpm",
     eta: float = 0.0,
+    save_path: str = None,
     metrics: str = None,
+    save_log_path: str = None,
     overfit_single_batch: bool = False,
     override: bool = False,
 ):
@@ -592,6 +610,8 @@ def main(
             sample_kwargs['sampler'] = sampler
         if 'eta' in locals() and eta is not None:
             sample_kwargs['eta'] = eta
+        if save_path is not None:
+            sample_kwargs['save_path'] = save_path
 
         result = sample.remote(**sample_kwargs)
         print(result)
@@ -612,6 +632,12 @@ def main(
             eval_kwargs['batch_size'] = batch_size
         if num_steps is not None:
             eval_kwargs['num_steps'] = num_steps
+        if 'sampler' in locals() and sampler is not None:
+            eval_kwargs['sampler'] = sampler
+        if 'eta' in locals() and eta is not None:
+            eval_kwargs['eta'] = eta
+        if save_log_path is not None:
+            eval_kwargs['save_log_path'] = save_log_path
 
         result = evaluate_torch_fidelity.remote(**eval_kwargs)
         print(result)
