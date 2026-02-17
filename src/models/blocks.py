@@ -230,12 +230,18 @@ class AttentionBlock(nn.Module):
                        three=3, heads=self.num_heads, head_dim=self.head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]
         
+        # Cast to float32 for numerical stability under mixed precision (FP16 overflows easily)
+        q, k, v = q.float(), k.float(), v.float()
+
         # Attention: softmax(Q @ K^T / sqrt(d)) @ V
         attn = torch.einsum('bhid,bhjd->bhij', q, k) * self.scale
         attn = F.softmax(attn, dim=-1)
         
         # Apply attention to values
         out = torch.einsum('bhij,bhjd->bhid', attn, v)
+        
+        # Cast back to original dtype (e.g. FP16 under mixed precision)
+        out = out.to(x.dtype)
         
         # Reshape back to spatial dimensions
         out = rearrange(out, 'b heads (h w) head_dim -> b (heads head_dim) h w',

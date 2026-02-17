@@ -597,6 +597,7 @@ def main(
     method: str = "ddpm",
     config: str = None,
     checkpoint: str = None,
+    resume_from: str = None,
     iterations: int = None,
     batch_size: int = None,
     learning_rate: float = None,
@@ -646,6 +647,7 @@ def main(
         result = train_fn.remote(
             method=method,
             config_path=config,
+            resume_from=resume_from,
             num_iterations=iterations,
             batch_size=batch_size,
             learning_rate=learning_rate,
