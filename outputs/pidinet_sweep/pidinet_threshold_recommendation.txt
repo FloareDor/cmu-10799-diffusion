@@ -1,0 +1,10 @@
+PiDiNet safe=True threshold sweep
+num_samples=64
+target_density=0.12
+
+Sorted by score (lower is better):
+t=0.35 mean=0.0485 std=0.0186 min=0.0101 max=0.1030 score=0.0761
+t=0.45 mean=0.0485 std=0.0186 min=0.0101 max=0.1030 score=0.0761
+t=0.55 mean=0.0215 std=0.0103 min=0.0017 max=0.0480 score=0.1011
+
+RECOMMENDED_THRESHOLD=0.35
