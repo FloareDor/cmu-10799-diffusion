@@ -1,4 +1,4 @@
-"""Compare Canny (multiple sigmas), XDoG, PiDiNet, and HED on 10 CelebA samples."""
+"""Compare Canny (multiple sigmas), XDoG, and HED on CelebA samples. PiDiNet commented out."""
 import random
 from pathlib import Path
 
@@ -6,7 +6,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from datasets import load_dataset
-from controlnet_aux import PidiNetDetector, HEDdetector
+from controlnet_aux import HEDdetector
+# from controlnet_aux import PidiNetDetector
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = REPO_ROOT / "data" / "celeba-subset"
@@ -43,14 +44,15 @@ def main():
     )
     print(f"Loaded dataset: {len(ds)} images")
 
-    print("Loading PiDiNet...")
-    pidinet = PidiNetDetector.from_pretrained("lllyasviel/Annotators")
-    print("PiDiNet loaded.")
+    # print("Loading PiDiNet...")
+    # pidinet = PidiNetDetector.from_pretrained("lllyasviel/Annotators")
+    # print("PiDiNet loaded.")
     print("Loading HED...")
     hed = HEDdetector.from_pretrained("lllyasviel/Annotators")
     print("HED loaded.")
 
-    indices = random.sample(range(len(ds)), 10)
+    n_samples = 10
+    indices = random.sample(range(len(ds)), n_samples)
 
     out_dir = REPO_ROOT / "outputs" / "full_edge_compare_v2"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -60,36 +62,41 @@ def main():
         img = ds[idx]["image"].convert("RGB")
         arr = np.array(img)
 
-        # Canny (our pick) and Canny s1.3 for reference
+        # Canny: 0.7, 1.0, 1.1, 1.2, 1.3
+        canny_s07 = canny_edges(arr, sigma=0.7, low=50, high=150)
         canny_s10 = canny_edges(arr, sigma=1.0, low=50, high=150)
+        canny_s11 = canny_edges(arr, sigma=1.1, low=50, high=150)
+        canny_s12 = canny_edges(arr, sigma=1.2, low=50, high=150)
         canny_s13 = canny_edges(arr, sigma=1.3, low=50, high=150)
 
-        # XDoG sigma sweep (all phi=10)
+        # XDoG sigma sweep (less sparse = finer: .22, .25, .28, .29, .30)
+        xdog_s022 = xdog_edges(arr, sigma=0.22, phi=10.0)
         xdog_s025 = xdog_edges(arr, sigma=0.25, phi=10.0)
         xdog_s0275 = xdog_edges(arr, sigma=0.275, phi=10.0)
         xdog_s0288 = xdog_edges(arr, sigma=0.288, phi=10.0)
         xdog_s03 = xdog_edges(arr, sigma=0.3, phi=10.0)
 
-        # PiDiNet nofilter
-        pidi_nofilter = pidinet(img, safe=False, apply_filter=False).convert("RGB")
+        # PiDiNet nofilter (commented out)
+        # pidi_nofilter = pidinet(img, safe=False, apply_filter=False).convert("RGB")
 
-        # HED
+        # HED: default and higher detect_resolution (less sparse / more detail)
         hed_img = hed(img).convert("RGB")
+        hed_hi = hed(img, detect_resolution=768, image_resolution=768).convert("RGB")
 
-        rows.append((img, canny_s10, canny_s13, xdog_s025, xdog_s0275, xdog_s0288, xdog_s03, pidi_nofilter, hed_img))
-        print(f"[{row_i+1}/10] idx={idx}")
+        rows.append((img, canny_s07, canny_s10, canny_s11, canny_s12, canny_s13, xdog_s022, xdog_s025, xdog_s0275, xdog_s0288, xdog_s03, hed_img, hed_hi))
+        print(f"[{row_i+1}/{n_samples}] idx={idx}")
 
     # Column labels (minimal)
     labels = [
-        "Orig", "Canny 1.0", "Canny 1.3",
-        "XDoG .25", "XDoG .28", "XDoG .29", "XDoG .30",
-        "PiDi nofilter",
-        "HED",
+        "Orig", "Canny 0.7", "Canny 1.0", "Canny 1.1", "Canny 1.2", "Canny 1.3",
+        "XDoG .22", "XDoG .25", "XDoG .28", "XDoG .29", "XDoG .30",
+        "HED", "HED 768",
     ]
     w, h = rows[0][0].size
-    cols = 9
+    cols = 13
     header_h = 28
-    grid_h = 10 * h
+    n_rows = len(rows)
+    grid_h = n_rows * h
     total_h = header_h + grid_h
     grid = Image.new("RGB", (cols * w, total_h), color=(255, 255, 255))
     draw = ImageDraw.Draw(grid)
@@ -120,7 +127,7 @@ def main():
     grid_path = out_dir / "full_compare_grid.png"
     grid.save(grid_path)
     print(f"\nSaved: {grid_path}")
-    print("Columns: Orig | Canny s1.0 | Canny s1.3 | XDoG s0.25 | XDoG s0.275 | XDoG s0.288 | XDoG s0.3 | PiDiNet nofilter | HED")
+    print("Columns: Orig | Canny 0.7–1.3 | XDoG .22–.30 | HED | HED 768")
 
 
 if __name__ == "__main__":

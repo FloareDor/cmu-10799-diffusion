@@ -22,7 +22,12 @@ class FlowMatching(BaseMethod):
         self.num_timesteps = num_timesteps
         self.to(device)
 
-    def compute_loss(self, x_1: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(
+        self,
+        x_1: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute the flow matching loss.
         
@@ -55,7 +60,8 @@ class FlowMatching(BaseMethod):
         # Note: Some implementations use t * 1000, others use specific embeddings.
         # We'll stick to scaling to match the UNet's expected input range.
         t_input = t * (self.num_timesteps - 1)
-        v_theta = self.model(x_t, t_input)
+        model_input = torch.cat([x_t, condition], dim=1) if condition is not None else x_t
+        v_theta = self.model(model_input, t_input)
         
         loss = F.mse_loss(v_theta, target)
         
@@ -67,6 +73,7 @@ class FlowMatching(BaseMethod):
         batch_size: int,
         image_shape: Tuple[int, int, int],
         num_steps: int = 50,
+        condition: Optional[torch.Tensor] = None,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -84,6 +91,12 @@ class FlowMatching(BaseMethod):
         
         # Start from pure noise at t=0
         x_t = torch.randn(batch_size, *image_shape, device=self.device)
+        if condition is not None:
+            condition = condition.to(self.device)
+            if condition.shape[0] != batch_size:
+                raise ValueError(
+                    f"Condition batch size ({condition.shape[0]}) must match batch_size ({batch_size})."
+                )
         
         dt = 1.0 / num_steps
         
@@ -97,7 +110,8 @@ class FlowMatching(BaseMethod):
             t_input = t * (self.num_timesteps - 1)
             
             # Predict velocity
-            v_theta = self.model(x_t, t_input)
+            model_input = torch.cat([x_t, condition], dim=1) if condition is not None else x_t
+            v_theta = self.model(model_input, t_input)
             
             # Euler step: x_{t+dt} = x_t + v_theta * dt
             x_t = x_t + v_theta * dt

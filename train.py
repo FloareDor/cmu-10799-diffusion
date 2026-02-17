@@ -29,7 +29,7 @@ import argparse
 import math
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 import yaml
 import torch
@@ -206,6 +206,7 @@ def generate_samples(
     config: dict,
     ema: Optional[EMA] = None,
     current_step: Optional[int] = None,
+    condition: Optional[torch.Tensor] = None,
     # TODO: add/delete your arguments here
     **sampling_kwargs,
 ) -> torch.Tensor:
@@ -243,6 +244,7 @@ def generate_samples(
         batch_size=num_samples,
         image_shape=image_shape,
         num_steps=num_steps,
+        condition=condition,
         **sampling_kwargs,
     )
 
@@ -274,6 +276,40 @@ def save_samples(
     # nrow calculation makes a nice square grid (e.g. 64 samples -> 8x8 grid)
     nrow = int(math.sqrt(num_samples))
     save_image(samples, save_path, nrow=nrow)
+
+
+def _unpack_batch(
+    batch: Any,
+    device: torch.device,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Convert a dataloader batch into (images, condition) tensors on device."""
+    if isinstance(batch, (tuple, list)) and len(batch) == 2:
+        images, condition = batch
+        return images.to(device), condition.to(device)
+    if torch.is_tensor(batch):
+        return batch.to(device), None
+    raise TypeError(f"Unsupported batch type for training: {type(batch)}")
+
+
+def _repeat_to_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Repeat/truncate tensor on batch dimension to exactly match batch_size."""
+    if tensor.shape[0] == batch_size:
+        return tensor
+    repeats = (batch_size + tensor.shape[0] - 1) // tensor.shape[0]
+    repeat_dims = [repeats] + [1] * (tensor.dim() - 1)
+    return tensor.repeat(*repeat_dims)[:batch_size]
+
+
+def save_conditional_triplet_grid(
+    condition: torch.Tensor,
+    generated: torch.Tensor,
+    target: torch.Tensor,
+    save_path: str,
+) -> None:
+    """Save per-sample side-by-side panels: edge | generated | ground truth."""
+    panel = torch.cat([unnormalize(condition), unnormalize(generated), unnormalize(target)], dim=3)
+    nrow = int(math.sqrt(panel.shape[0]))
+    save_image(panel, save_path, nrow=nrow)
 
 
 def train(
@@ -482,30 +518,40 @@ def train(
     # Pro tips: before big training runs, it's usually a good idea to sanity check 
     # by overfitting to a single batch with a small number of training iterations
     # For single batch overfitting, grab one batch and reuse it
-    single_batch = None
-    single_batch_base = None  # Store the original small batch
+    single_batch_images = None
+    single_batch_condition = None
     if overfit_single_batch:
         single_batch_base = next(data_iter)
-        if isinstance(single_batch_base, (tuple, list)):
-            single_batch_base = single_batch_base[0]  # Handle (image, label) tuples
-        single_batch_base = single_batch_base.to(device)
+        base_images, base_condition = _unpack_batch(single_batch_base, device)
 
         # Replicate to match desired batch size
-        base_batch_size = single_batch_base.shape[0]
+        base_batch_size = base_images.shape[0]
         desired_batch_size = training_config['batch_size']
 
         if desired_batch_size > base_batch_size:
-            # Replicate the batch to reach desired size
-            num_repeats = (desired_batch_size + base_batch_size - 1) // base_batch_size
-            single_batch = single_batch_base.repeat(num_repeats, 1, 1, 1)[:desired_batch_size]
+            single_batch_images = _repeat_to_batch(base_images, desired_batch_size)
+            if base_condition is not None:
+                single_batch_condition = _repeat_to_batch(base_condition, desired_batch_size)
             if is_main_process:
                 print(f"Cached single batch: {base_batch_size} samples replicated to {desired_batch_size}")
-                print(f"  Base batch shape: {single_batch_base.shape}")
-                print(f"  Training batch shape: {single_batch.shape}")
+                print(f"  Base image batch shape: {base_images.shape}")
+                print(f"  Training image batch shape: {single_batch_images.shape}")
         else:
-            single_batch = single_batch_base
+            single_batch_images = base_images
+            single_batch_condition = base_condition
             if is_main_process:
-                print(f"Cached single batch with shape: {single_batch.shape}")
+                print(f"Cached single batch with shape: {single_batch_images.shape}")
+
+    fixed_condition_samples = None
+    fixed_target_samples = None
+    if data_config.get('conditional', False):
+        fixed_source = (single_batch_images, single_batch_condition) if overfit_single_batch else next(iter(dataloader))
+        if not overfit_single_batch:
+            fixed_source = _unpack_batch(fixed_source, device)
+        fixed_images, fixed_condition = fixed_source
+        if fixed_condition is not None:
+            fixed_condition_samples = _repeat_to_batch(fixed_condition, num_samples)
+            fixed_target_samples = _repeat_to_batch(fixed_images, num_samples)
 
     metrics_sum = {}
     metrics_count = 0
@@ -520,7 +566,8 @@ def train(
     for step in pbar:
         # Get batch (cycle through dataset or use single batch)
         if overfit_single_batch:
-            batch = single_batch
+            images = single_batch_images
+            condition = single_batch_condition
         else:
             try:
                 batch = next(data_iter)
@@ -530,17 +577,13 @@ def train(
                     sampler.set_epoch(epoch)
                 data_iter = iter(dataloader)
                 batch = next(data_iter)
-
-            if isinstance(batch, (tuple, list)):
-                batch = batch[0]  # Handle (image, label) tuples
-
-            batch = batch.to(device)
+            images, condition = _unpack_batch(batch, device)
         
         # Forward pass with mixed precision
         optimizer.zero_grad()
         
         with autocast(device_type, enabled=config['infrastructure']['mixed_precision']):
-            loss, metrics = method.compute_loss(batch)
+            loss, metrics = method.compute_loss(images, condition=condition)
         
         # Backward pass
         scaler.scale(loss).backward()
@@ -617,9 +660,18 @@ def train(
                     config,
                     ema,
                     current_step=step + 1,
+                    condition=fixed_condition_samples,
                 )
                 sample_path = os.path.join(log_dir, 'samples', f'samples_{step + 1:07d}.png')
-                save_samples(samples, sample_path, num_samples)
+                if fixed_condition_samples is not None and fixed_target_samples is not None:
+                    save_conditional_triplet_grid(
+                        condition=fixed_condition_samples,
+                        generated=samples,
+                        target=fixed_target_samples,
+                        save_path=sample_path,
+                    )
+                else:
+                    save_samples(samples, sample_path, num_samples)
 
                 # Log samples to wandb
                 if wandb_run is not None:

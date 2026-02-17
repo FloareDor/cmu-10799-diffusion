@@ -27,13 +27,16 @@ import sys
 import argparse
 import math
 from datetime import datetime
+from pathlib import Path
 
 import yaml
 import torch
 from tqdm import tqdm
+from PIL import Image
+from torchvision import transforms
 
 from src.models import create_model_from_config
-from src.data import save_image, unnormalize
+from src.data import save_image, unnormalize, create_dataloader_from_config, xdog_edges
 from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
@@ -74,6 +77,57 @@ def save_samples(
     save_image(samples, save_path, nrow=nrow)
 
 
+def _repeat_to_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if tensor.shape[0] == batch_size:
+        return tensor
+    repeats = (batch_size + tensor.shape[0] - 1) // tensor.shape[0]
+    repeat_dims = [repeats] + [1] * (tensor.dim() - 1)
+    return tensor.repeat(*repeat_dims)[:batch_size]
+
+
+def _load_condition_from_source(
+    config: dict,
+    edge_source: str,
+    num_samples: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if edge_source == "dataset":
+        condition_config = dict(config)
+        condition_config['data'] = dict(config['data'])
+        condition_config['data']['conditional'] = True
+        dataloader = create_dataloader_from_config(condition_config, split='train')
+        batch = next(iter(dataloader))
+        if not isinstance(batch, (tuple, list)) or len(batch) != 2:
+            raise RuntimeError("Expected conditional dataset batch to return (images, edges).")
+        edges = batch[1]
+        return _repeat_to_batch(edges, num_samples).to(device)
+
+    image_dir = Path(edge_source)
+    if not image_dir.exists():
+        raise FileNotFoundError(f"Edge source path does not exist: {edge_source}")
+    image_files = sorted(
+        [p for p in image_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".webp"}]
+    )
+    if len(image_files) == 0:
+        raise FileNotFoundError(f"No images found in: {edge_source}")
+    to_tensor = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+    tensors = []
+    target_size = (config['data']['image_size'], config['data']['image_size'])
+    for p in image_files:
+        img = Image.open(p).convert("RGB").resize(target_size, Image.BILINEAR)
+        sketch = xdog_edges(img)
+        tensors.append(to_tensor(sketch))
+        if len(tensors) >= num_samples:
+            break
+    if len(tensors) < num_samples:
+        stacked = torch.stack(tensors, dim=0)
+        return _repeat_to_batch(stacked, num_samples).to(device)
+    return torch.stack(tensors, dim=0).to(device)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate samples from trained model')
     parser.add_argument('--checkpoint', type=str, required=True,
@@ -93,6 +147,8 @@ def main():
                        help='Batch size for generation')
     parser.add_argument('--seed', type=int, default=None,
                        help='Random seed for reproducibility')
+    parser.add_argument('--edge_source', type=str, default=None,
+                       help='Condition source: "dataset" or directory path containing source images')
     
     # Sampling arguments
     parser.add_argument('--num_steps', type=int, default=None,
@@ -148,10 +204,16 @@ def main():
     
     # Generate samples
     print(f"Generating {args.num_samples} samples...")
+    condition_all = None
+    if args.edge_source is not None:
+        condition_all = _load_condition_from_source(config, args.edge_source, args.num_samples, device)
+        print(f"Using sketch conditioning from: {args.edge_source}")
 
     all_samples = []
+    all_conditions = []
     remaining = args.num_samples
     sample_idx = 0
+    generated_so_far = 0
 
     # Create output directory if saving individual images
     if not args.grid:
@@ -163,11 +225,15 @@ def main():
             batch_size = min(args.batch_size, remaining)
 
             num_steps = args.num_steps or config['sampling']['num_steps']
+            condition_batch = None
+            if condition_all is not None:
+                condition_batch = condition_all[generated_so_far:generated_so_far + batch_size]
 
             samples = method.sample(
                 batch_size=batch_size,
                 image_shape=image_shape,
                 num_steps=num_steps,
+                condition=condition_batch,
                 method=args.sampler,
                 eta=args.eta,
             )
@@ -175,13 +241,20 @@ def main():
             # Save individual images immediately or collect for grid
             if args.grid:
                 all_samples.append(samples)
+                if condition_batch is not None:
+                    all_conditions.append(condition_batch)
             else:
                 for i in range(samples.shape[0]):
                     img_path = os.path.join(args.output_dir, f"{sample_idx:06d}.png")
-                    save_samples(samples[i:i+1], img_path, 1)
+                    if condition_batch is not None:
+                        panel = torch.cat([condition_batch[i:i+1], samples[i:i+1]], dim=3)
+                        save_samples(panel, img_path, 1)
+                    else:
+                        save_samples(samples[i:i+1], img_path, 1)
                     sample_idx += 1
 
             remaining -= batch_size
+            generated_so_far += batch_size
             pbar.update(batch_size)
 
         pbar.close()
@@ -190,13 +263,19 @@ def main():
     if args.grid:
         # Concatenate all samples for grid
         all_samples = torch.cat(all_samples, dim=0)[:args.num_samples]
+        if condition_all is not None:
+            all_conditions = torch.cat(all_conditions, dim=0)[:args.num_samples]
 
         if args.output is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             args.output = f"samples_{timestamp}.png"
 
         nrow = int(math.sqrt(all_samples.shape[0]))
-        save_samples(all_samples, args.output, nrow=nrow)
+        if condition_all is not None:
+            panel = torch.cat([all_conditions, all_samples], dim=3)
+            save_samples(panel, args.output, nrow=nrow)
+        else:
+            save_samples(all_samples, args.output, nrow=nrow)
         print(f"Saved grid to {args.output}")
     else:
         print(f"Saved {args.num_samples} individual images to {args.output_dir}")

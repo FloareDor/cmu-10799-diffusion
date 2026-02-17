@@ -33,6 +33,7 @@ image = (
         "einops>=0.6.0",
         "tqdm>=4.64.0",
         "scipy>=1.9.0",
+        "opencv-python-headless>=4.0.0",
         "wandb>=0.15.0",
         "datasets>=2.0.0",  # For HuggingFace Hub dataset loading
         "torch-fidelity>=0.3.0",  # Comprehensive evaluation metrics
@@ -67,6 +68,9 @@ def _train_impl(
     import yaml
     import tempfile
     import subprocess
+    import time
+    import json
+    from datetime import datetime
 
     sys.path.insert(0, "/root")
 
@@ -113,6 +117,10 @@ def _train_impl(
 
     resume_path = f"/data/{resume_from}" if resume_from else None
 
+    # Track wall-clock time for training summary (answers Q7b)
+    train_start_time = time.time()
+    train_start_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     # Use torchrun for multi-GPU, direct import for single GPU
     if num_gpus > 1:
         temp_config_path = None
@@ -141,6 +149,53 @@ def _train_impl(
     else:
         from train import train as run_training
         run_training(method_name=method, config=config, resume_path=resume_path, overfit_single_batch=overfit_single_batch)
+
+    # Save training summary JSON for homework answers (Q7b, Q8)
+    train_end_time = time.time()
+    elapsed_seconds = train_end_time - train_start_time
+    elapsed_h = int(elapsed_seconds // 3600)
+    elapsed_m = int((elapsed_seconds % 3600) // 60)
+    elapsed_s = int(elapsed_seconds % 60)
+
+    import subprocess as _sp
+    try:
+        gpu_info = _sp.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            text=True
+        ).strip()
+    except Exception:
+        gpu_info = f"{num_gpus}x GPU (nvidia-smi unavailable)"
+
+    summary = {
+        "method": method,
+        "config": config_tag,
+        "num_gpus": num_gpus,
+        "gpu_info": gpu_info,
+        "num_iterations": config['training']['num_iterations'],
+        "batch_size_per_gpu": config['training']['batch_size'],
+        "effective_batch_size": config['training']['batch_size'] * num_gpus,
+        "learning_rate": config['training']['learning_rate'],
+        "mixed_precision": config['infrastructure'].get('mixed_precision', False),
+        "sample_every": config['training'].get('sample_every'),
+        "save_every": config['training'].get('save_every'),
+        "train_start": train_start_str,
+        "train_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "wall_time_seconds": round(elapsed_seconds, 1),
+        "wall_time_human": f"{elapsed_h}h {elapsed_m}m {elapsed_s}s",
+        "checkpoint_dir": config['checkpoint']['dir'],
+        "log_dir": config['logging']['dir'],
+        "resume_from": resume_from,
+    }
+
+    summary_dir = f"/data/hw3_answers/{config_tag}"
+    os.makedirs(summary_dir, exist_ok=True)
+    summary_path = os.path.join(summary_dir, "training_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"\n[HW3] Training summary saved to {summary_path}")
+    print(f"[HW3] Wall-clock time: {summary['wall_time_human']}")
+    print(f"[HW3] GPU: {gpu_info}")
+    print(f"[HW3] Effective batch size: {summary['effective_batch_size']} ({num_gpus} GPUs x {config['training']['batch_size']})")
 
     volume.commit()
     return f"Training complete! Checkpoints saved to /data/checkpoints/{method}"
@@ -209,6 +264,7 @@ def sample(
     num_steps: int = None,
     sampler: str = "ddpm",
     eta: float = 0.0,
+    edge_source: str = None,
     save_path: str = None,
 ):
     """
@@ -249,6 +305,8 @@ def sample(
         cmd.extend(["--num_samples", str(num_samples)])
     if num_steps is not None:
         cmd.extend(["--num_steps", str(num_steps)])
+    if edge_source is not None:
+        cmd.extend(["--edge_source", edge_source])
 
     subprocess.run(cmd, check=True)
     volume.commit()
@@ -546,6 +604,7 @@ def main(
     num_steps: int = None,
     sampler: str = "ddpm",
     eta: float = 0.0,
+    edge_source: str = None,
     save_path: str = None,
     metrics: str = None,
     save_log_path: str = None,
@@ -602,6 +661,7 @@ def main(
             'checkpoint': checkpoint,
             'num_samples': num_samples,
             'num_steps': num_steps,
+            'edge_source': edge_source,
         }
         
         # Add optional sampler and eta if they exist in locals or are passed

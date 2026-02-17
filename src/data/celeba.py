@@ -12,7 +12,7 @@ What you need to implement:
 """
 
 import os
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Union
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -21,6 +21,41 @@ from torchvision.transforms import functional as TF
 from torchvision.utils import make_grid as torch_make_grid
 from torchvision.utils import save_image as torch_save_image
 from PIL import Image
+import numpy as np
+
+
+def xdog_edges(
+    pil_image: Image.Image,
+    sigma: float = 0.29,
+    k: float = 1.6,
+    gamma: float = 0.98,
+    epsilon: float = 0.01,
+    phi: float = 10.0,
+) -> Image.Image:
+    """Extract XDoG sketch-like edges from a PIL RGB image and return a 3-channel PIL image."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV is required for conditional edge extraction. "
+            "Install with: pip install opencv-python-headless"
+        ) from exc
+
+    arr = np.array(pil_image)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    g1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    g2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma * k, sigmaY=sigma * k)
+    dog = g1 - gamma * g2
+    dog = dog / (dog.max() + 1e-8)
+    result = np.where(
+        dog >= epsilon,
+        np.ones_like(dog),
+        1.0 + np.tanh(phi * (dog - epsilon)),
+    )
+    result = np.clip(result, 0.0, 1.0)
+    inv = 1.0 - result
+    edges_3ch = (np.stack([inv, inv, inv], axis=-1) * 255.0).astype(np.uint8)
+    return Image.fromarray(edges_3ch)
 
 
 class CelebADataset(Dataset):
@@ -46,6 +81,7 @@ class CelebADataset(Dataset):
         split: str = "train",
         image_size: int = 64,
         augment: bool = True,
+        conditional: bool = False,
         from_hub: bool = False,
         repo_name: str = "electronickale/cmu-10799-celeba64-subset",
     ):
@@ -53,11 +89,16 @@ class CelebADataset(Dataset):
         self.split = split
         self.image_size = image_size
         self.augment = augment
+        self.conditional = conditional
         self.from_hub = from_hub
         self.repo_name = repo_name
 
         # Build transforms
         self.transform = self._build_transforms() # TODO write your own image transform function
+        self.base_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ])
 
         # Load dataset based on mode
         if from_hub:
@@ -246,7 +287,7 @@ class CelebADataset(Dataset):
     def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Get a single image.
 
@@ -270,10 +311,16 @@ class CelebADataset(Dataset):
             # Local mode: load from file path
             image = Image.open(item["image"]).convert("RGB")
 
-        # Apply transforms
+        if self.conditional:
+            edge = xdog_edges(image)
+            if self.augment and self.split == "train" and torch.rand(()) < 0.5:
+                image = TF.hflip(image)
+                edge = TF.hflip(edge)
+            return self.base_transform(image), self.base_transform(edge)
+
+        # Apply transforms for unconditional setup
         if self.transform:
             image = self.transform(image)
-
         return image
 
 
@@ -285,6 +332,7 @@ def create_dataloader(
     num_workers: int = 4,
     pin_memory: bool = True,
     augment: bool = True,
+    conditional: bool = False,
     shuffle: Optional[bool] = None,
     drop_last: bool = True,
     from_hub: bool = False,
@@ -314,6 +362,7 @@ def create_dataloader(
         split=split,
         image_size=image_size,
         augment=augment,
+        conditional=conditional,
         from_hub=from_hub,
         repo_name=repo_name,
     )
@@ -355,6 +404,7 @@ def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoa
         num_workers=data_config['num_workers'],
         pin_memory=data_config['pin_memory'],
         augment=(split == "train" and data_config.get('augment', True)),
+        conditional=data_config.get('conditional', False),
         from_hub=data_config.get('from_hub', False),
         repo_name=data_config.get('repo_name', 'electronickale/cmu-10799-celeba64-subset'),
     )

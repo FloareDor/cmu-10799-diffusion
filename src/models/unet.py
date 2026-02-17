@@ -280,7 +280,7 @@ def create_model_from_config(config: dict) -> UNet:
     data_config = config['data']
     
     return UNet(
-        in_channels=data_config['channels'],
+        in_channels=model_config.get('in_channels', data_config['channels']),
         out_channels=data_config['channels'],
         base_channels=model_config['base_channels'],
         channel_mult=tuple(model_config['channel_mult']),

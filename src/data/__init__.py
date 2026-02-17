@@ -6,6 +6,7 @@ This module contains dataset loading and preprocessing utilities.
 
 from .celeba import (
     CelebADataset,
+    xdog_edges,
     create_dataloader,
     create_dataloader_from_config,
     unnormalize,
@@ -16,6 +17,7 @@ from .celeba import (
 
 __all__ = [
     'CelebADataset',
+    'xdog_edges',
     'create_dataloader',
     'create_dataloader_from_config',
     'unnormalize',
