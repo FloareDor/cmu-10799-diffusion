@@ -36,7 +36,7 @@ from PIL import Image
 from torchvision import transforms
 
 from src.models import create_model_from_config
-from src.data import save_image, unnormalize, create_dataloader_from_config, xdog_edges
+from src.data import save_image, unnormalize, create_dataloader_from_config, xdog_edges, canny_edges
 from src.methods import DDPM, FlowMatching
 from src.utils import EMA
 
@@ -118,7 +118,11 @@ def _load_condition_from_source(
     target_size = (config['data']['image_size'], config['data']['image_size'])
     for p in image_files:
         img = Image.open(p).convert("RGB").resize(target_size, Image.BILINEAR)
-        sketch = xdog_edges(img)
+        edge_method = config['data'].get('edge_method', 'xdog')
+        if edge_method == "canny":
+            sketch = canny_edges(img)
+        else:
+            sketch = xdog_edges(img)
         tensors.append(to_tensor(sketch))
         if len(tensors) >= num_samples:
             break

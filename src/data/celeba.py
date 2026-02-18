@@ -24,6 +24,29 @@ from PIL import Image
 import numpy as np
 
 
+def canny_edges(
+    pil_image: Image.Image,
+    sigma: float = 1.2,
+    low: int = 50,
+    high: int = 150,
+) -> Image.Image:
+    """Extract Canny edges from a PIL RGB image and return a 3-channel PIL image."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV is required for conditional edge extraction. "
+            "Install with: pip install opencv-python-headless"
+        ) from exc
+
+    arr = np.array(pil_image)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    edges = cv2.Canny(blurred, low, high)
+    edges_3ch = np.stack([edges, edges, edges], axis=-1)
+    return Image.fromarray(edges_3ch)
+
+
 def xdog_edges(
     pil_image: Image.Image,
     sigma: float = 0.29,
@@ -82,6 +105,7 @@ class CelebADataset(Dataset):
         image_size: int = 64,
         augment: bool = True,
         conditional: bool = False,
+        edge_method: str = "xdog",
         from_hub: bool = False,
         repo_name: str = "electronickale/cmu-10799-celeba64-subset",
     ):
@@ -90,6 +114,7 @@ class CelebADataset(Dataset):
         self.image_size = image_size
         self.augment = augment
         self.conditional = conditional
+        self.edge_method = edge_method
         self.from_hub = from_hub
         self.repo_name = repo_name
 
@@ -312,7 +337,10 @@ class CelebADataset(Dataset):
             image = Image.open(item["image"]).convert("RGB")
 
         if self.conditional:
-            edge = xdog_edges(image)
+            if self.edge_method == "canny":
+                edge = canny_edges(image)
+            else:
+                edge = xdog_edges(image)
             if self.augment and self.split == "train" and torch.rand(()) < 0.5:
                 image = TF.hflip(image)
                 edge = TF.hflip(edge)
@@ -333,6 +361,7 @@ def create_dataloader(
     pin_memory: bool = True,
     augment: bool = True,
     conditional: bool = False,
+    edge_method: str = "xdog",
     shuffle: Optional[bool] = None,
     drop_last: bool = True,
     from_hub: bool = False,
@@ -363,6 +392,7 @@ def create_dataloader(
         image_size=image_size,
         augment=augment,
         conditional=conditional,
+        edge_method=edge_method,
         from_hub=from_hub,
         repo_name=repo_name,
     )
@@ -405,6 +435,7 @@ def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoa
         pin_memory=data_config['pin_memory'],
         augment=(split == "train" and data_config.get('augment', True)),
         conditional=data_config.get('conditional', False),
+        edge_method=data_config.get('edge_method', 'xdog'),
         from_hub=data_config.get('from_hub', False),
         repo_name=data_config.get('repo_name', 'electronickale/cmu-10799-celeba64-subset'),
     )
