@@ -367,17 +367,17 @@ def train(
         print("DEVICE CONFIGURATION")
         print("=" * 60)
         if is_distributed:
-            print(f"✓ Distributed training enabled")
+            print("[ok] Distributed training enabled")
             print(f"  - World size: {world_size} GPU(s)")
             print(f"  - Backend: {backend}")
             print(f"  - Device: {device}")
         else:
             if device.type == 'cuda':
                 gpu_name = torch.cuda.get_device_name(device)
-                print(f"✓ Single GPU training")
+                print("[ok] Single GPU training")
                 print(f"  - Device: {device} ({gpu_name})")
             else:
-                print(f"✓ CPU training")
+                print("[ok] CPU training")
                 print(f"  - Device: {device}")
         print(f"  - Config device setting: {config_device}")
         print(f"  - Mixed precision: {config['infrastructure'].get('mixed_precision', False)}")

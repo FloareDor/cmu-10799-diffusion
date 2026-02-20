@@ -1,18 +1,12 @@
 """
-CelebA Dataset Loading and Preprocessing
+CelebA Dataset Loading and Preprocessing.
 
-This module handles loading and preprocessing the CelebA dataset for
-training diffusion models. It includes:
-- Loading from HuggingFace Hub (electronickale/cmu-10799-celeba64-subset)
-- Loading from local directory (downloaded datasets)
-
-What you need to implement:
-- Data preprocessing and postprocessing transform functions
-- Data augmentations if needed
+Includes conditional edge/sketch generation for Canny/XDoG/HED/PiDiNet and
+mixed conditioning for robust freehand-style control.
 """
 
 import os
-from typing import Optional, Tuple, Callable, Union
+from typing import Optional, Tuple, Callable, Union, List, Dict
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -24,27 +18,81 @@ from PIL import Image
 import numpy as np
 
 
+_HED_DETECTOR = None
+_PIDI_DETECTOR = None
+_DETECTOR_WARNED = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if key in _DETECTOR_WARNED:
+        return
+    _DETECTOR_WARNED.add(key)
+    print(msg)
+
+
+def _ensure_white_edges_on_black(gray_uint8: np.ndarray) -> np.ndarray:
+    # Heuristic polarity fix: if bright background dominates, invert to ensure
+    # white edges on black background.
+    if gray_uint8.mean() > 127:
+        gray_uint8 = 255 - gray_uint8
+    return gray_uint8
+
+
+def _gray_to_rgb_pil(gray_uint8: np.ndarray) -> Image.Image:
+    rgb = np.stack([gray_uint8, gray_uint8, gray_uint8], axis=-1)
+    return Image.fromarray(rgb.astype(np.uint8), mode="RGB")
+
+
+def _get_hed_detector():
+    global _HED_DETECTOR
+    if _HED_DETECTOR is not None:
+        return _HED_DETECTOR
+    try:
+        from controlnet_aux import HEDdetector
+    except ImportError as exc:
+        raise ImportError(
+            "HED edge extraction requires controlnet-aux. Install with: pip install controlnet-aux"
+        ) from exc
+    _HED_DETECTOR = HEDdetector.from_pretrained("lllyasviel/Annotators")
+    _warn_once("hed_loaded", "[edge] Loaded HED detector (lllyasviel/Annotators).")
+    return _HED_DETECTOR
+
+
+def _get_pidinet_detector():
+    global _PIDI_DETECTOR
+    if _PIDI_DETECTOR is not None:
+        return _PIDI_DETECTOR
+    try:
+        from controlnet_aux import PidiNetDetector
+    except ImportError as exc:
+        raise ImportError(
+            "PiDiNet edge extraction requires controlnet-aux. Install with: pip install controlnet-aux"
+        ) from exc
+    _PIDI_DETECTOR = PidiNetDetector.from_pretrained("lllyasviel/Annotators")
+    _warn_once("pidi_loaded", "[edge] Loaded PiDiNet detector (lllyasviel/Annotators).")
+    return _PIDI_DETECTOR
+
+
 def canny_edges(
     pil_image: Image.Image,
     sigma: float = 1.2,
     low: int = 50,
     high: int = 150,
 ) -> Image.Image:
-    """Extract Canny edges from a PIL RGB image and return a 3-channel PIL image."""
+    """Extract Canny edges as 3-channel white edges on black."""
     try:
         import cv2
     except ImportError as exc:
         raise ImportError(
-            "OpenCV is required for conditional edge extraction. "
-            "Install with: pip install opencv-python-headless"
+            "OpenCV is required for edge extraction. Install with: pip install opencv-python-headless"
         ) from exc
 
-    arr = np.array(pil_image)
+    arr = np.array(pil_image.convert("RGB"), dtype=np.uint8)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
     edges = cv2.Canny(blurred, low, high)
-    edges_3ch = np.stack([edges, edges, edges], axis=-1)
-    return Image.fromarray(edges_3ch)
+    edges = _ensure_white_edges_on_black(edges)
+    return _gray_to_rgb_pil(edges)
 
 
 def xdog_edges(
@@ -55,47 +103,75 @@ def xdog_edges(
     epsilon: float = 0.01,
     phi: float = 10.0,
 ) -> Image.Image:
-    """Extract XDoG sketch-like edges from a PIL RGB image and return a 3-channel PIL image."""
+    """Extract XDoG edges as 3-channel white edges on black."""
     try:
         import cv2
     except ImportError as exc:
         raise ImportError(
-            "OpenCV is required for conditional edge extraction. "
-            "Install with: pip install opencv-python-headless"
+            "OpenCV is required for edge extraction. Install with: pip install opencv-python-headless"
         ) from exc
 
-    arr = np.array(pil_image)
+    arr = np.array(pil_image.convert("RGB"), dtype=np.uint8)
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
     g1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma, sigmaY=sigma)
     g2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=sigma * k, sigmaY=sigma * k)
     dog = g1 - gamma * g2
-    dog = dog / (dog.max() + 1e-8)
-    result = np.where(
-        dog >= epsilon,
-        np.ones_like(dog),
-        1.0 + np.tanh(phi * (dog - epsilon)),
-    )
+    dog = dog / (np.max(np.abs(dog)) + 1e-8)
+    result = np.where(dog >= epsilon, np.ones_like(dog), 1.0 + np.tanh(phi * (dog - epsilon)))
     result = np.clip(result, 0.0, 1.0)
-    inv = 1.0 - result
-    edges_3ch = (np.stack([inv, inv, inv], axis=-1) * 255.0).astype(np.uint8)
-    return Image.fromarray(edges_3ch)
+    edges = ((1.0 - result) * 255.0).astype(np.uint8)
+    edges = _ensure_white_edges_on_black(edges)
+    return _gray_to_rgb_pil(edges)
+
+
+def hed_edges(
+    pil_image: Image.Image,
+    detect_resolution: Optional[int] = None,
+    image_resolution: Optional[int] = None,
+) -> Image.Image:
+    """Extract HED edges as 3-channel white edges on black."""
+    detector = _get_hed_detector()
+    kwargs = {}
+    if detect_resolution is not None:
+        kwargs["detect_resolution"] = detect_resolution
+    if image_resolution is not None:
+        kwargs["image_resolution"] = image_resolution
+
+    # controlnet_aux signatures vary by version, so we fallback gracefully.
+    try:
+        out = detector(pil_image.convert("RGB"), **kwargs)
+    except TypeError:
+        out = detector(pil_image.convert("RGB"))
+
+    gray = np.array(out.convert("L"), dtype=np.uint8)
+    gray = _ensure_white_edges_on_black(gray)
+    return _gray_to_rgb_pil(gray)
+
+
+def pidinet_edges(
+    pil_image: Image.Image,
+    threshold: float = 0.5,
+    use_binary: bool = False,
+) -> Image.Image:
+    """Extract PiDiNet edges as 3-channel white edges on black."""
+    detector = _get_pidinet_detector()
+    threshold = float(np.clip(threshold, 0.0, 1.0))
+
+    try:
+        out = detector(pil_image.convert("RGB"), safe=True, apply_filter=False)
+    except TypeError:
+        out = detector(pil_image.convert("RGB"), safe=True)
+
+    gray = np.array(out.convert("L"), dtype=np.uint8)
+    if use_binary:
+        gray = (gray >= int(255 * threshold)).astype(np.uint8) * 255
+    gray = _ensure_white_edges_on_black(gray)
+    return _gray_to_rgb_pil(gray)
 
 
 class CelebADataset(Dataset):
     """
     CelebA dataset wrapper with preprocessing for diffusion models.
-
-    Supports two modes:
-    1. HuggingFace mode: Loads from HuggingFace Hub (electronickale/cmu-10799-celeba64-subset)
-    2. Local mode: Loads from local directory with images/ and attributes.csv
-
-    Args:
-        root: Root directory for the dataset (e.g., "./data/celeba-subset")
-        split: Dataset split ('train', 'validation', or 'all') (currently only 'train' is available)
-        image_size: Target image resolution (default: 64, images are already 64x64)
-        augment: Whether to apply data augmentation
-        from_hub: Whether to load from HuggingFace Hub (default: False, loads locally)
-        repo_name: HuggingFace repo name (default: "electronickale/cmu-10799-celeba64-subset")
     """
 
     def __init__(
@@ -108,31 +184,61 @@ class CelebADataset(Dataset):
         edge_method: str = "xdog",
         from_hub: bool = False,
         repo_name: str = "electronickale/cmu-10799-celeba64-subset",
+        edge_mix_methods: Optional[List[str]] = None,
+        edge_mix_alpha: float = 1.0,
+        edge_mix_binary_prob: float = 0.35,
+        edge_mix_dropout_prob: float = 0.05,
+        edge_mix_blur_prob: float = 0.20,
+        edge_mix_morph_prob: float = 0.20,
+        edge_mix_hed_detect_resolution: Optional[int] = None,
+        edge_mix_hed_image_resolution: Optional[int] = None,
+        edge_mix_pidinet_threshold: float = 0.5,
+        edge_mix_pidinet_binary: bool = False,
     ):
         self.root = root
         self.split = split
         self.image_size = image_size
         self.augment = augment
         self.conditional = conditional
-        self.edge_method = edge_method
+        self.edge_method = edge_method.lower()
         self.from_hub = from_hub
         self.repo_name = repo_name
 
-        # Build transforms
-        self.transform = self._build_transforms() # TODO write your own image transform function
-        self.base_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        # Mixed edge conditioning options.
+        self.edge_mix_methods = (
+            [m.lower() for m in edge_mix_methods]
+            if edge_mix_methods is not None
+            else ["canny", "xdog", "hed", "pidinet"]
+        )
+        if len(self.edge_mix_methods) == 0:
+            raise ValueError("edge_mix_methods cannot be empty when edge_method='mixed'.")
+        self.edge_mix_alpha = float(edge_mix_alpha)
+        self.edge_mix_binary_prob = float(np.clip(edge_mix_binary_prob, 0.0, 1.0))
+        self.edge_mix_dropout_prob = float(np.clip(edge_mix_dropout_prob, 0.0, 1.0))
+        self.edge_mix_blur_prob = float(np.clip(edge_mix_blur_prob, 0.0, 1.0))
+        self.edge_mix_morph_prob = float(np.clip(edge_mix_morph_prob, 0.0, 1.0))
+        self.edge_mix_hed_detect_resolution = edge_mix_hed_detect_resolution
+        self.edge_mix_hed_image_resolution = edge_mix_hed_image_resolution
+        self.edge_mix_pidinet_threshold = float(np.clip(edge_mix_pidinet_threshold, 0.0, 1.0))
+        self.edge_mix_pidinet_binary = bool(edge_mix_pidinet_binary)
 
-        # Load dataset based on mode
+        if self.edge_mix_alpha <= 0:
+            raise ValueError("edge_mix_alpha must be > 0.")
+
+        self.transform = self._build_transforms()
+        self.base_transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ]
+        )
+
         if from_hub:
             self._load_from_hub()
         else:
             self._load_from_local()
 
     def _load_from_hub(self):
-        """Load dataset from HuggingFace Hub or cached Arrow format."""
         try:
             from datasets import load_dataset, load_from_disk
         except ImportError:
@@ -141,52 +247,40 @@ class CelebADataset(Dataset):
                 "  pip install datasets"
             )
 
-        # First, try to load from local cached dataset if root path is provided
         from pathlib import Path
+
         root_path = Path(self.root)
         print(f"Attempt to use cached dataset from: {self.root}")
         if root_path.exists() and (root_path / "dataset_dict.json").exists():
             print("=" * 60)
-            print(f"✓ Using cached dataset from: {self.root}")
-            print("  (No download required - using local Arrow format cache)")
+            print(f"[ok] Using cached dataset from: {self.root}")
             print("=" * 60)
 
-            # Map split names (HF uses 'validation' not 'valid')
             hf_split = "validation" if self.split == "valid" else self.split
-
-            # Load the dataset from disk
             dataset = load_from_disk(self.root)
 
             if hf_split == "all":
-                # Combine all splits
                 all_data = []
                 for split_name in dataset.keys():
                     all_data.extend(list(dataset[split_name]))
                 self.data = all_data
             else:
                 self.data = list(dataset[hf_split])
-
-            print(f"✓ Loaded {len(self.data)} images from cached '{hf_split}' split")
+            print(f"[ok] Loaded {len(self.data)} images from cached '{hf_split}' split")
             return
 
-        # Otherwise, download from HuggingFace Hub
         print("=" * 60)
-        print(f"⬇ Downloading dataset from HuggingFace Hub: {self.repo_name}")
-        print(f"  (This may take a few minutes on first run)")
+        print(f"[download] HuggingFace dataset: {self.repo_name}")
         print("=" * 60)
 
-        # Map split names (HF uses 'validation' not 'valid')
         hf_split = "validation" if self.split == "valid" else self.split
-
         cache_dir = None
         if self.root:
             os.makedirs(self.root, exist_ok=True)
             cache_dir = self.root
-            print(f"Using HuggingFace cache directory: {self.root}")
 
         if hf_split == "all":
             self.dataset = load_dataset(self.repo_name, cache_dir=cache_dir)
-            # Combine all splits
             all_data = []
             for split_name in self.dataset.keys():
                 all_data.extend(list(self.dataset[split_name]))
@@ -198,26 +292,15 @@ class CelebADataset(Dataset):
         print(f"Loaded {len(self.data)} images from {hf_split} split")
 
     def _load_from_local(self):
-        """Load dataset from local directory."""
         from pathlib import Path
 
-        # First, try loading from HuggingFace saved dataset (Arrow format)
-        # This is used when dataset was downloaded with save_to_disk()
         if self._try_load_from_saved_dataset():
             return
 
-        # Otherwise, fall back to loading from image files
-        # Map split names for directory structure
-        split_dir = self.split
-        if self.split == "valid":
-            split_dir = "validation"
-
-        # Determine the split directory
+        split_dir = "validation" if self.split == "valid" else self.split
         if self.split == "all":
-            # Load both train and validation
             train_path = Path(self.root) / "train"
             val_path = Path(self.root) / "validation"
-
             self.data = []
             if train_path.exists():
                 self.data.extend(self._load_split_data(train_path))
@@ -226,127 +309,149 @@ class CelebADataset(Dataset):
         else:
             split_path = Path(self.root) / split_dir
             self.data = self._load_split_data(split_path)
-
         print(f"Loaded {len(self.data)} images from local directory")
 
-    def _try_load_from_saved_dataset(self):
-        """Try to load from HuggingFace saved dataset format (Arrow).
-
-        Returns True if successful, False otherwise.
-        """
+    def _try_load_from_saved_dataset(self) -> bool:
         from pathlib import Path
 
-        # Check if this looks like a HuggingFace saved dataset
         root_path = Path(self.root)
         if not root_path.exists():
             return False
-
-        # HuggingFace datasets saved with save_to_disk() have dataset_info.json
         if not (root_path / "dataset_info.json").exists():
             return False
-
         try:
             from datasets import load_from_disk
         except ImportError:
             return False
 
-        print(f"Loading dataset from saved HuggingFace format: {self.root}")
-
-        # Map split names
         hf_split = "validation" if self.split == "valid" else self.split
-
-        # Load the dataset
         dataset = load_from_disk(self.root)
-
         if hf_split == "all":
-            # Combine all splits
             all_data = []
             for split_name in dataset.keys():
                 all_data.extend(list(dataset[split_name]))
             self.data = all_data
         else:
             self.data = list(dataset[hf_split])
-
         print(f"Loaded {len(self.data)} images from {hf_split} split")
         return True
 
     def _load_split_data(self, split_path):
-        """Load data from a split directory."""
         from pathlib import Path
 
         images_dir = split_path / "images"
         if not images_dir.exists():
             raise FileNotFoundError(
                 f"Images directory not found: {images_dir}\n"
-                f"Please download the dataset first using:\n"
-                f"  python dataset_processing/download_dataset.py"
+                "Please download the dataset first."
             )
 
-        # Get all image files
         image_files = sorted(images_dir.glob("*.png"))
         if not image_files:
             image_files = sorted(images_dir.glob("*.jpg"))
 
-        # Create data entries
         data = []
         for img_path in image_files:
-            data.append({
-                "image": str(img_path),
-                "image_id": img_path.name,
-            })
-
+            data.append({"image": str(img_path), "image_id": img_path.name})
         return data
-    
-    def _build_transforms(self) -> Callable:
-        """Build the preprocessing transforms."""
-        transform_list = []
 
+    def _build_transforms(self) -> Callable:
+        transform_list = []
         if self.augment and self.split == "train":
             transform_list.append(transforms.RandomHorizontalFlip())
-        
         transform_list.append(transforms.ToTensor())
         transform_list.append(transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))
-
         return transforms.Compose(transform_list)
+
+    def _single_edge(self, image: Image.Image, method: str) -> Image.Image:
+        m = method.lower()
+        if m == "canny":
+            out = canny_edges(image)
+            return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
+        if m == "xdog":
+            out = xdog_edges(image)
+            return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
+        if m == "hed":
+            out = hed_edges(
+                image,
+                detect_resolution=self.edge_mix_hed_detect_resolution,
+                image_resolution=self.edge_mix_hed_image_resolution,
+            )
+            return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
+        if m == "pidinet":
+            out = pidinet_edges(
+                image,
+                threshold=self.edge_mix_pidinet_threshold,
+                use_binary=self.edge_mix_pidinet_binary,
+            )
+            return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
+        raise ValueError(f"Unsupported edge method: {method}")
+
+    def _apply_mushy_aug(self, edge01: np.ndarray) -> np.ndarray:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "OpenCV is required for mixed edge augmentations. Install with: pip install opencv-python-headless"
+            ) from exc
+
+        x = edge01.astype(np.float32)
+        if np.random.rand() < self.edge_mix_morph_prob:
+            k = np.random.choice([1, 2])
+            kernel = np.ones((2 * k + 1, 2 * k + 1), dtype=np.uint8)
+            if np.random.rand() < 0.5:
+                x = cv2.dilate(x, kernel, iterations=1)
+            else:
+                x = cv2.erode(x, kernel, iterations=1)
+        if np.random.rand() < self.edge_mix_blur_prob:
+            sigma = float(np.random.uniform(0.4, 1.4))
+            x = cv2.GaussianBlur(x, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        if np.random.rand() < self.edge_mix_dropout_prob:
+            keep = np.random.rand(*x.shape) > self.edge_mix_dropout_prob
+            x = x * keep.astype(np.float32)
+        if np.random.rand() < self.edge_mix_binary_prob:
+            thr = float(np.random.uniform(0.35, 0.65))
+            x = (x >= thr).astype(np.float32)
+        return np.clip(x, 0.0, 1.0)
+
+    def _mixed_edges(self, image: Image.Image) -> Image.Image:
+        maps = []
+        for method in self.edge_mix_methods:
+            emap = self._single_edge(image, method)
+            gray = np.array(emap.convert("L"), dtype=np.float32) / 255.0
+            maps.append(gray)
+        stacked = np.stack(maps, axis=0)  # (K, H, W)
+
+        alpha = np.full((len(self.edge_mix_methods),), self.edge_mix_alpha, dtype=np.float64)
+        weights = np.random.dirichlet(alpha).astype(np.float32)
+        mix = np.tensordot(weights, stacked, axes=(0, 0))
+        mix = self._apply_mushy_aug(mix)
+        mix_u8 = (mix * 255.0).astype(np.uint8)
+        mix_u8 = _ensure_white_edges_on_black(mix_u8)
+        return _gray_to_rgb_pil(mix_u8)
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Get a single image.
-
-        Args:
-            idx: Index of the image
-
-        Returns:
-            Image tensor of shape (3, image_size, image_size) in range [-1, 1]
-
-        Note:
-            We only return the image, not the attributes, since we're doing
-            unconditional generation.
-        """
         item = self.data[idx]
 
-        # Load image
         if self.from_hub:
-            # HuggingFace datasets provide PIL images directly
-            image = item["image"]
+            image = item["image"].convert("RGB")
         else:
-            # Local mode: load from file path
             image = Image.open(item["image"]).convert("RGB")
 
         if self.conditional:
-            if self.edge_method == "canny":
-                edge = canny_edges(image)
+            if self.edge_method == "mixed":
+                edge = self._mixed_edges(image)
             else:
-                edge = xdog_edges(image)
+                edge = self._single_edge(image, self.edge_method)
+
             if self.augment and self.split == "train" and torch.rand(()) < 0.5:
                 image = TF.hflip(image)
                 edge = TF.hflip(edge)
             return self.base_transform(image), self.base_transform(edge)
 
-        # Apply transforms for unconditional setup
         if self.transform:
             image = self.transform(image)
         return image
@@ -366,26 +471,17 @@ def create_dataloader(
     drop_last: bool = True,
     from_hub: bool = False,
     repo_name: str = "electronickale/cmu-10799-celeba64-subset",
+    edge_mix_methods: Optional[List[str]] = None,
+    edge_mix_alpha: float = 1.0,
+    edge_mix_binary_prob: float = 0.35,
+    edge_mix_dropout_prob: float = 0.05,
+    edge_mix_blur_prob: float = 0.20,
+    edge_mix_morph_prob: float = 0.20,
+    edge_mix_hed_detect_resolution: Optional[int] = None,
+    edge_mix_hed_image_resolution: Optional[int] = None,
+    edge_mix_pidinet_threshold: float = 0.5,
+    edge_mix_pidinet_binary: bool = False,
 ) -> DataLoader:
-    """
-    Create a DataLoader for CelebA.
-
-    Args:
-        root: Root directory for local dataset (default: "./data/celeba-subset")
-        split: Dataset split ('train', 'validation', or 'all')
-        image_size: Target image resolution (default: 64)
-        batch_size: Batch size
-        num_workers: Number of data loading workers
-        pin_memory: Whether to pin memory for faster GPU transfer
-        augment: Whether to apply data augmentation
-        shuffle: Whether to shuffle (defaults to True for train, False otherwise)
-        drop_last: Whether to drop the last incomplete batch
-        from_hub: Whether to load from HuggingFace Hub (default: False)
-        repo_name: HuggingFace repo name (default: "electronickale/cmu-10799-celeba64-subset")
-
-    Returns:
-        DataLoader instance
-    """
     dataset = CelebADataset(
         root=root,
         split=split,
@@ -395,12 +491,22 @@ def create_dataloader(
         edge_method=edge_method,
         from_hub=from_hub,
         repo_name=repo_name,
+        edge_mix_methods=edge_mix_methods,
+        edge_mix_alpha=edge_mix_alpha,
+        edge_mix_binary_prob=edge_mix_binary_prob,
+        edge_mix_dropout_prob=edge_mix_dropout_prob,
+        edge_mix_blur_prob=edge_mix_blur_prob,
+        edge_mix_morph_prob=edge_mix_morph_prob,
+        edge_mix_hed_detect_resolution=edge_mix_hed_detect_resolution,
+        edge_mix_hed_image_resolution=edge_mix_hed_image_resolution,
+        edge_mix_pidinet_threshold=edge_mix_pidinet_threshold,
+        edge_mix_pidinet_binary=edge_mix_pidinet_binary,
     )
 
     if shuffle is None:
-        shuffle = (split == "train")
+        shuffle = split == "train"
 
-    dataloader = DataLoader(
+    return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
@@ -409,89 +515,51 @@ def create_dataloader(
         drop_last=drop_last,
     )
 
-    return dataloader
-
 
 def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoader:
-    """
-    Create a DataLoader from a configuration dictionary.
-
-    Args:
-        config: Configuration dictionary
-        split: Dataset split
-
-    Returns:
-        DataLoader instance
-    """
-    data_config = config['data']
-    training_config = config['training']
+    data_config = config["data"]
+    training_config = config["training"]
 
     return create_dataloader(
-        root=data_config.get('root', './data/celeba-subset'),
+        root=data_config.get("root", "./data/celeba-subset"),
         split=split,
-        image_size=data_config['image_size'],
-        batch_size=training_config['batch_size'],
-        num_workers=data_config['num_workers'],
-        pin_memory=data_config['pin_memory'],
-        augment=(split == "train" and data_config.get('augment', True)),
-        conditional=data_config.get('conditional', False),
-        edge_method=data_config.get('edge_method', 'xdog'),
-        from_hub=data_config.get('from_hub', False),
-        repo_name=data_config.get('repo_name', 'electronickale/cmu-10799-celeba64-subset'),
+        image_size=data_config["image_size"],
+        batch_size=training_config["batch_size"],
+        num_workers=data_config["num_workers"],
+        pin_memory=data_config["pin_memory"],
+        augment=(split == "train" and data_config.get("augment", True)),
+        conditional=data_config.get("conditional", False),
+        edge_method=data_config.get("edge_method", "xdog"),
+        from_hub=data_config.get("from_hub", False),
+        repo_name=data_config.get("repo_name", "electronickale/cmu-10799-celeba64-subset"),
+        edge_mix_methods=data_config.get("edge_mix_methods", None),
+        edge_mix_alpha=float(data_config.get("edge_mix_alpha", 1.0)),
+        edge_mix_binary_prob=float(data_config.get("edge_mix_binary_prob", 0.35)),
+        edge_mix_dropout_prob=float(data_config.get("edge_mix_dropout_prob", 0.05)),
+        edge_mix_blur_prob=float(data_config.get("edge_mix_blur_prob", 0.20)),
+        edge_mix_morph_prob=float(data_config.get("edge_mix_morph_prob", 0.20)),
+        edge_mix_hed_detect_resolution=data_config.get("edge_mix_hed_detect_resolution", None),
+        edge_mix_hed_image_resolution=data_config.get("edge_mix_hed_image_resolution", None),
+        edge_mix_pidinet_threshold=float(data_config.get("edge_mix_pidinet_threshold", 0.5)),
+        edge_mix_pidinet_binary=bool(data_config.get("edge_mix_pidinet_binary", False)),
     )
 
-"""
-Some helper fuctions
-"""
+
 def unnormalize(images: torch.Tensor) -> torch.Tensor:
-    """
-    Convert images from [-1, 1] to [0, 1] range.
-
-    Args:
-        images: Image tensor of shape (B, C, H, W) or (C, H, W) in range [-1, 1]
-
-    Returns:
-        Image tensor in range [0, 1]
-    """
+    """Convert images from [-1, 1] to [0, 1]."""
     return (images + 1.0) / 2.0
 
 
 def normalize(images: torch.Tensor) -> torch.Tensor:
-    """
-    Convert images from [0, 1] to [-1, 1] range.
-
-    Args:
-        images: Image tensor of shape (B, C, H, W) or (C, H, W) in range [0, 1]
-
-    Returns:
-        Image tensor in range [-1, 1]
-    """
+    """Convert images from [0, 1] to [-1, 1]."""
     return images * 2.0 - 1.0
 
 
 def make_grid(images: torch.Tensor, nrow: int = 8, **kwargs) -> torch.Tensor:
-    """
-    Create a grid of images.
-
-    Args:
-        images: Image tensor of shape (B, C, H, W)
-        nrow: Number of images per row
-        **kwargs: Additional arguments passed to torchvision.utils.make_grid
-
-    Returns:
-        Grid tensor of shape (C, H', W')
-    """
+    """Create a grid of images."""
     return torch_make_grid(images, nrow=nrow, **kwargs)
 
 
 def save_image(images: torch.Tensor, path: str, nrow: int = 8, **kwargs):
-    """
-    Save a batch of images as a grid.
-
-    Args:
-        images: Image tensor of shape (B, C, H, W) in range [-1, 1] or [0, 1]
-        path: File path to save the image
-        nrow: Number of images per row
-        **kwargs: Additional arguments passed to torchvision.utils.save_image
-    """
+    """Save a batch of images as a grid."""
     torch_save_image(images, path, nrow=nrow, **kwargs)

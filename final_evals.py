@@ -25,7 +25,7 @@ def run_batch_evaluations():
     # ---------------------------------------------------------
     # Part 1: KID Evaluations
     # ---------------------------------------------------------
-    print("🚀 Launching KID evaluation jobs...")
+    print("[run] Launching KID evaluation jobs...")
     
     kid_jobs = []
     for steps in steps_list:
@@ -42,12 +42,12 @@ def run_batch_evaluations():
         evaluate_torch_fidelity.spawn(**job_args)
         kid_jobs.append(steps)
         
-    print(f"✅ Spawned {len(kid_jobs)} KID jobs")
+    print(f"[ok] Spawned {len(kid_jobs)} KID jobs")
 
     # ---------------------------------------------------------
     # Part 2: Qualitative Samples
     # ---------------------------------------------------------
-    print("🖼️  Launching sample generation jobs...")
+    print("[run] Launching sample generation jobs...")
     
     sample_jobs = []
     for steps in steps_list:
@@ -60,7 +60,7 @@ def run_batch_evaluations():
         sample_fn.spawn(**job_args)
         sample_jobs.append(steps)
 
-    print(f"✅ Spawned {len(sample_jobs)} sampling jobs")
+    print(f"[ok] Spawned {len(sample_jobs)} sampling jobs")
     print("\nCheck the Modal dashboard to monitor progress.")
 
 if __name__ == "__main__":

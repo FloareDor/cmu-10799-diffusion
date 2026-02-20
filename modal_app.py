@@ -34,6 +34,7 @@ image = (
         "tqdm>=4.64.0",
         "scipy>=1.9.0",
         "opencv-python-headless>=4.0.0",
+        "controlnet-aux>=0.0.9",
         "wandb>=0.15.0",
         "datasets>=2.0.0",  # For HuggingFace Hub dataset loading
         "torch-fidelity>=0.3.0",  # Comprehensive evaluation metrics
@@ -727,7 +728,7 @@ def run_q7_ablation(
     # Part 1: KID Evaluations (1000 samples each)
     # ============================================================================
     print(f"--- Part 1: KID Evaluations (1000 samples each) ---")
-    print("🚀 Launching KID evaluation jobs...")
+    print("[run] Launching KID evaluation jobs...")
 
     kid_handles = []
     for steps in steps_list_parsed:
@@ -743,8 +744,8 @@ def run_q7_ablation(
         )
         kid_handles.append((steps, handle))
 
-    print(f"✅ Submitted {len(steps_list_parsed)} KID evaluation jobs!")
-    print("⏳ Waiting for results...\n")
+    print(f"[ok] Submitted {len(steps_list_parsed)} KID evaluation jobs!")
+    print("[wait] Waiting for results...\n")
 
     # Wait for all jobs and collect results
     kid_results = {}
@@ -757,14 +758,14 @@ def run_q7_ablation(
             print(result)
             kid_results[steps] = result
         except Exception as e:
-            print(f"❌ Error for {steps} steps: {e}")
+            print(f"[err] Error for {steps} steps: {e}")
             kid_results[steps] = f"ERROR: {e}"
 
     # ============================================================================
     # Part 2: Qualitative Samples (1 sample per step count)
     # ============================================================================
     print(f"\n--- Part 2: Qualitative Samples (1 sample per step count) ---")
-    print("🖼️  Launching sample generation jobs...")
+    print("[run] Launching sample generation jobs...")
 
     sample_handles = []
     for steps in steps_list_parsed:
@@ -776,21 +777,21 @@ def run_q7_ablation(
         )
         sample_handles.append((steps, handle))
 
-    print(f"✅ Submitted {len(steps_list_parsed)} sample generation jobs!")
-    print("⏳ Waiting for sample generation to complete...\n")
+    print(f"[ok] Submitted {len(steps_list_parsed)} sample generation jobs!")
+    print("[wait] Waiting for sample generation to complete...\n")
 
     # Wait for all sample jobs
     for steps, handle in sample_handles:
         try:
             result = handle.get()
-            print(f"✅ {steps} steps: {result}")
+            print(f"[ok] {steps} steps: {result}")
         except Exception as e:
-            print(f"❌ Error generating sample for {steps} steps: {e}")
+            print(f"[err] Error generating sample for {steps} steps: {e}")
 
     # ============================================================================
     # Summary - Save consolidated log file
     # ============================================================================
-    print("\n📊 Summary:")
+    print("\n[summary]")
     print(f"  - KID evaluations: {len(steps_list_parsed)} jobs (1000 samples each)")
     print(f"  - Qualitative samples: {len(steps_list_parsed)} jobs (1 sample each)")
 
@@ -821,10 +822,10 @@ def run_q7_ablation(
     summary_content = "\n".join(summary_lines)
 
     # Save summary to volume
-    print("\n📝 Saving consolidated summary log...")
+    print("\n[run] Saving consolidated summary log...")
     save_summary_log.remote("q7_ablation/kid_summary.txt", summary_content)
 
-    print(f"\n✅ All jobs completed!")
-    print(f"📁 Logs saved to /data/q7_ablation/ on Modal volume")
+    print(f"\n[ok] All jobs completed.")
+    print(f"[path] Logs saved to /data/q7_ablation/ on Modal volume")
     print(f"   - Individual logs: kid_<steps>steps.txt")
     print(f"   - Summary: kid_summary.txt")
