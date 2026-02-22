@@ -51,8 +51,8 @@ volume = modal.Volume.from_name("cmu-10799-diffusion-data", create_if_missing=Tr
 DATA_DIR = "/data"
 
 # ── Checkpoints directories on the volume (under DATA_DIR). Latest flow_matching_*.pt is chosen from each.
-CANNY_CHECKPOINTS_DIR = "logs/edge_canny_flow_matching_modal_2gpu/flow_matching_20260217_225006/checkpoints"
-XDOG_CHECKPOINTS_DIR = "logs/edge_flow_matching_modal_4gpu/flow_matching_20260217_230045/checkpoints"
+CANNY_CHECKPOINTS_DIR = "logs/hw4_edge_canny2_only/flow_matching_20260221_082439/checkpoints"
+XDOG_CHECKPOINTS_DIR = "logs/hw4_edge_xdog028_eagf_modal_2gpu/flow_matching_20260221_152822/checkpoints"
 
 
 def find_latest_checkpoint(

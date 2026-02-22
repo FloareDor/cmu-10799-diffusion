@@ -1,11 +1,12 @@
 """
 CelebA Dataset Loading and Preprocessing.
 
-Includes conditional edge/sketch generation for Canny/XDoG/HED/PiDiNet and
+Includes conditional edge/sketch generation for Canny/XDoG and
 mixed conditioning for robust freehand-style control.
 """
 
 import os
+from pathlib import Path
 from typing import Optional, Tuple, Callable, Union, List, Dict
 
 import torch
@@ -18,8 +19,6 @@ from PIL import Image
 import numpy as np
 
 
-_HED_DETECTOR = None
-_PIDI_DETECTOR = None
 _DETECTOR_WARNED = set()
 
 
@@ -43,34 +42,13 @@ def _gray_to_rgb_pil(gray_uint8: np.ndarray) -> Image.Image:
     return Image.fromarray(rgb.astype(np.uint8), mode="RGB")
 
 
-def _get_hed_detector():
-    global _HED_DETECTOR
-    if _HED_DETECTOR is not None:
-        return _HED_DETECTOR
-    try:
-        from controlnet_aux import HEDdetector
-    except ImportError as exc:
-        raise ImportError(
-            "HED edge extraction requires controlnet-aux. Install with: pip install controlnet-aux"
-        ) from exc
-    _HED_DETECTOR = HEDdetector.from_pretrained("lllyasviel/Annotators")
-    _warn_once("hed_loaded", "[edge] Loaded HED detector (lllyasviel/Annotators).")
-    return _HED_DETECTOR
-
-
-def _get_pidinet_detector():
-    global _PIDI_DETECTOR
-    if _PIDI_DETECTOR is not None:
-        return _PIDI_DETECTOR
-    try:
-        from controlnet_aux import PidiNetDetector
-    except ImportError as exc:
-        raise ImportError(
-            "PiDiNet edge extraction requires controlnet-aux. Install with: pip install controlnet-aux"
-        ) from exc
-    _PIDI_DETECTOR = PidiNetDetector.from_pretrained("lllyasviel/Annotators")
-    _warn_once("pidi_loaded", "[edge] Loaded PiDiNet detector (lllyasviel/Annotators).")
-    return _PIDI_DETECTOR
+def _parse_method(method: str) -> Tuple[str, Optional[float]]:
+    """Return (base_method, sigma_or_none). method:sigma syntax supported."""
+    m = method.lower()
+    if ":" in m:
+        base, sigma_str = m.split(":", 1)
+        return base.strip(), float(sigma_str.strip())
+    return m, None
 
 
 def canny_edges(
@@ -124,51 +102,6 @@ def xdog_edges(
     return _gray_to_rgb_pil(edges)
 
 
-def hed_edges(
-    pil_image: Image.Image,
-    detect_resolution: Optional[int] = None,
-    image_resolution: Optional[int] = None,
-) -> Image.Image:
-    """Extract HED edges as 3-channel white edges on black."""
-    detector = _get_hed_detector()
-    kwargs = {}
-    if detect_resolution is not None:
-        kwargs["detect_resolution"] = detect_resolution
-    if image_resolution is not None:
-        kwargs["image_resolution"] = image_resolution
-
-    # controlnet_aux signatures vary by version, so we fallback gracefully.
-    try:
-        out = detector(pil_image.convert("RGB"), **kwargs)
-    except TypeError:
-        out = detector(pil_image.convert("RGB"))
-
-    gray = np.array(out.convert("L"), dtype=np.uint8)
-    gray = _ensure_white_edges_on_black(gray)
-    return _gray_to_rgb_pil(gray)
-
-
-def pidinet_edges(
-    pil_image: Image.Image,
-    threshold: float = 0.5,
-    use_binary: bool = False,
-) -> Image.Image:
-    """Extract PiDiNet edges as 3-channel white edges on black."""
-    detector = _get_pidinet_detector()
-    threshold = float(np.clip(threshold, 0.0, 1.0))
-
-    try:
-        out = detector(pil_image.convert("RGB"), safe=True, apply_filter=False)
-    except TypeError:
-        out = detector(pil_image.convert("RGB"), safe=True)
-
-    gray = np.array(out.convert("L"), dtype=np.uint8)
-    if use_binary:
-        gray = (gray >= int(255 * threshold)).astype(np.uint8) * 255
-    gray = _ensure_white_edges_on_black(gray)
-    return _gray_to_rgb_pil(gray)
-
-
 class CelebADataset(Dataset):
     """
     CelebA dataset wrapper with preprocessing for diffusion models.
@@ -190,10 +123,11 @@ class CelebADataset(Dataset):
         edge_mix_dropout_prob: float = 0.05,
         edge_mix_blur_prob: float = 0.20,
         edge_mix_morph_prob: float = 0.20,
-        edge_mix_hed_detect_resolution: Optional[int] = None,
-        edge_mix_hed_image_resolution: Optional[int] = None,
-        edge_mix_pidinet_threshold: float = 0.5,
-        edge_mix_pidinet_binary: bool = False,
+        edge_mix_canny_sigma: float = 1.2,
+        edge_mix_xdog_sigma: float = 0.29,
+        edge_mix_canny_low: int = 80,
+        edge_mix_canny_high: int = 200,
+        edge_mix_alpha_per_method: Optional[List[float]] = None,
     ):
         self.root = root
         self.split = split
@@ -208,7 +142,7 @@ class CelebADataset(Dataset):
         self.edge_mix_methods = (
             [m.lower() for m in edge_mix_methods]
             if edge_mix_methods is not None
-            else ["canny", "xdog", "hed", "pidinet"]
+            else ["canny", "xdog"]
         )
         if len(self.edge_mix_methods) == 0:
             raise ValueError("edge_mix_methods cannot be empty when edge_method='mixed'.")
@@ -217,10 +151,23 @@ class CelebADataset(Dataset):
         self.edge_mix_dropout_prob = float(np.clip(edge_mix_dropout_prob, 0.0, 1.0))
         self.edge_mix_blur_prob = float(np.clip(edge_mix_blur_prob, 0.0, 1.0))
         self.edge_mix_morph_prob = float(np.clip(edge_mix_morph_prob, 0.0, 1.0))
-        self.edge_mix_hed_detect_resolution = edge_mix_hed_detect_resolution
-        self.edge_mix_hed_image_resolution = edge_mix_hed_image_resolution
-        self.edge_mix_pidinet_threshold = float(np.clip(edge_mix_pidinet_threshold, 0.0, 1.0))
-        self.edge_mix_pidinet_binary = bool(edge_mix_pidinet_binary)
+        self.edge_mix_canny_sigma = float(edge_mix_canny_sigma)
+        self.edge_mix_xdog_sigma = float(edge_mix_xdog_sigma)
+        self.edge_mix_canny_low = int(edge_mix_canny_low)
+        self.edge_mix_canny_high = int(edge_mix_canny_high)
+        self.edge_mix_alpha_per_method = (
+            [float(a) for a in edge_mix_alpha_per_method]
+            if edge_mix_alpha_per_method is not None
+            else None
+        )
+        if self.edge_mix_alpha_per_method is not None:
+            if len(self.edge_mix_alpha_per_method) != len(self.edge_mix_methods):
+                raise ValueError(
+                    f"edge_mix_alpha_per_method length ({len(self.edge_mix_alpha_per_method)}) "
+                    f"must match edge_mix_methods length ({len(self.edge_mix_methods)})"
+                )
+            if any(a <= 0 for a in self.edge_mix_alpha_per_method):
+                raise ValueError("All edge_mix_alpha_per_method values must be > 0.")
 
         if self.edge_mix_alpha <= 0:
             raise ValueError("edge_mix_alpha must be > 0.")
@@ -364,26 +311,19 @@ class CelebADataset(Dataset):
         return transforms.Compose(transform_list)
 
     def _single_edge(self, image: Image.Image, method: str) -> Image.Image:
-        m = method.lower()
-        if m == "canny":
-            out = canny_edges(image)
-            return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
-        if m == "xdog":
-            out = xdog_edges(image)
-            return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
-        if m == "hed":
-            out = hed_edges(
+        base, sigma = _parse_method(method)
+        if base == "canny":
+            sig = sigma if sigma is not None else self.edge_mix_canny_sigma
+            out = canny_edges(
                 image,
-                detect_resolution=self.edge_mix_hed_detect_resolution,
-                image_resolution=self.edge_mix_hed_image_resolution,
+                sigma=sig,
+                low=self.edge_mix_canny_low,
+                high=self.edge_mix_canny_high,
             )
             return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
-        if m == "pidinet":
-            out = pidinet_edges(
-                image,
-                threshold=self.edge_mix_pidinet_threshold,
-                use_binary=self.edge_mix_pidinet_binary,
-            )
+        if base == "xdog":
+            sig = sigma if sigma is not None else self.edge_mix_xdog_sigma
+            out = xdog_edges(image, sigma=sig)
             return out.resize(image.size, Image.BILINEAR) if out.size != image.size else out
         raise ValueError(f"Unsupported edge method: {method}")
 
@@ -414,7 +354,7 @@ class CelebADataset(Dataset):
             x = (x >= thr).astype(np.float32)
         return np.clip(x, 0.0, 1.0)
 
-    def _mixed_edges(self, image: Image.Image) -> Image.Image:
+    def _mixed_edges(self, image: Image.Image, idx: Optional[int] = None) -> Image.Image:
         maps = []
         for method in self.edge_mix_methods:
             emap = self._single_edge(image, method)
@@ -422,7 +362,10 @@ class CelebADataset(Dataset):
             maps.append(gray)
         stacked = np.stack(maps, axis=0)  # (K, H, W)
 
-        alpha = np.full((len(self.edge_mix_methods),), self.edge_mix_alpha, dtype=np.float64)
+        if self.edge_mix_alpha_per_method is not None:
+            alpha = np.array(self.edge_mix_alpha_per_method, dtype=np.float64)
+        else:
+            alpha = np.full((len(self.edge_mix_methods),), self.edge_mix_alpha, dtype=np.float64)
         weights = np.random.dirichlet(alpha).astype(np.float32)
         mix = np.tensordot(weights, stacked, axes=(0, 0))
         mix = self._apply_mushy_aug(mix)
@@ -443,7 +386,7 @@ class CelebADataset(Dataset):
 
         if self.conditional:
             if self.edge_method == "mixed":
-                edge = self._mixed_edges(image)
+                edge = self._mixed_edges(image, idx=idx)
             else:
                 edge = self._single_edge(image, self.edge_method)
 
@@ -477,10 +420,11 @@ def create_dataloader(
     edge_mix_dropout_prob: float = 0.05,
     edge_mix_blur_prob: float = 0.20,
     edge_mix_morph_prob: float = 0.20,
-    edge_mix_hed_detect_resolution: Optional[int] = None,
-    edge_mix_hed_image_resolution: Optional[int] = None,
-    edge_mix_pidinet_threshold: float = 0.5,
-    edge_mix_pidinet_binary: bool = False,
+    edge_mix_canny_sigma: float = 1.2,
+    edge_mix_xdog_sigma: float = 0.29,
+    edge_mix_canny_low: int = 80,
+    edge_mix_canny_high: int = 200,
+    edge_mix_alpha_per_method: Optional[List[float]] = None,
 ) -> DataLoader:
     dataset = CelebADataset(
         root=root,
@@ -497,10 +441,11 @@ def create_dataloader(
         edge_mix_dropout_prob=edge_mix_dropout_prob,
         edge_mix_blur_prob=edge_mix_blur_prob,
         edge_mix_morph_prob=edge_mix_morph_prob,
-        edge_mix_hed_detect_resolution=edge_mix_hed_detect_resolution,
-        edge_mix_hed_image_resolution=edge_mix_hed_image_resolution,
-        edge_mix_pidinet_threshold=edge_mix_pidinet_threshold,
-        edge_mix_pidinet_binary=edge_mix_pidinet_binary,
+        edge_mix_canny_sigma=edge_mix_canny_sigma,
+        edge_mix_xdog_sigma=edge_mix_xdog_sigma,
+        edge_mix_canny_low=edge_mix_canny_low,
+        edge_mix_canny_high=edge_mix_canny_high,
+        edge_mix_alpha_per_method=edge_mix_alpha_per_method,
     )
 
     if shuffle is None:
@@ -538,10 +483,11 @@ def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoa
         edge_mix_dropout_prob=float(data_config.get("edge_mix_dropout_prob", 0.05)),
         edge_mix_blur_prob=float(data_config.get("edge_mix_blur_prob", 0.20)),
         edge_mix_morph_prob=float(data_config.get("edge_mix_morph_prob", 0.20)),
-        edge_mix_hed_detect_resolution=data_config.get("edge_mix_hed_detect_resolution", None),
-        edge_mix_hed_image_resolution=data_config.get("edge_mix_hed_image_resolution", None),
-        edge_mix_pidinet_threshold=float(data_config.get("edge_mix_pidinet_threshold", 0.5)),
-        edge_mix_pidinet_binary=bool(data_config.get("edge_mix_pidinet_binary", False)),
+        edge_mix_canny_sigma=float(data_config.get("edge_mix_canny_sigma", 1.2)),
+        edge_mix_xdog_sigma=float(data_config.get("edge_mix_xdog_sigma", 0.29)),
+        edge_mix_canny_low=int(data_config.get("edge_mix_canny_low", 80)),
+        edge_mix_canny_high=int(data_config.get("edge_mix_canny_high", 200)),
+        edge_mix_alpha_per_method=data_config.get("edge_mix_alpha_per_method", None),
     )
 
 

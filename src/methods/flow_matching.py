@@ -104,6 +104,10 @@ class FlowMatching(BaseMethod):
         t_input: torch.Tensor,
         condition: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        conditioning_mode = getattr(model_ref, "conditioning_mode", "concat")
+        if conditioning_mode == "edge_adapter":
+            return self.model(x_t, t_input, condition=condition)
         model_input = torch.cat([x_t, condition], dim=1) if condition is not None else x_t
         return self.model(model_input, t_input)
 

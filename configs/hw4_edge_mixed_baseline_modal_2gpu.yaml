@@ -5,21 +5,22 @@ data:
   repo_name: "electronickale/cmu-10799-celeba64-subset"
   image_size: 64
   channels: 3
-  num_workers: 4
+  num_workers: 2
   pin_memory: true
   augment: true
   conditional: true
   edge_method: mixed
-  edge_mix_methods: ["canny", "xdog", "hed", "pidinet"]
+  edge_mix_methods: ["xdog:0.28", "canny:2.3", "canny:2", "canny:1.75", "canny:1.5", "canny:1.2", "canny:1.0"]
   edge_mix_alpha: 1.0
+  edge_mix_alpha_per_method: [6, 1, 1, 1, 1, 1, 1]  # 50% XDoG, 50% six Canny combined
+  edge_mix_canny_low: 80
+  edge_mix_canny_high: 200
   edge_mix_binary_prob: 0.35
   edge_mix_dropout_prob: 0.05
   edge_mix_blur_prob: 0.20
   edge_mix_morph_prob: 0.20
-  edge_mix_hed_detect_resolution: 512
-  edge_mix_hed_image_resolution: 512
-  edge_mix_pidinet_threshold: 0.50
-  edge_mix_pidinet_binary: false
+  edge_mix_canny_sigma: 1.2
+  edge_mix_xdog_sigma: 0.29
 
 model:
   in_channels: 6

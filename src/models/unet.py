@@ -30,6 +30,40 @@ from .blocks import (
 )
 
 
+class EdgeAdapter(nn.Module):
+    """Lightweight multi-scale condition adapter for spatial control."""
+
+    def __init__(
+        self,
+        condition_channels: int,
+        hidden_channels: int,
+        skip_channels: List[int],
+        middle_channels: int,
+    ):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(condition_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.skip_projections = nn.ModuleList(
+            [nn.Conv2d(hidden_channels, ch, kernel_size=1) for ch in skip_channels]
+        )
+        self.middle_projection = nn.Conv2d(hidden_channels, middle_channels, kernel_size=1)
+
+    def encode(self, condition: torch.Tensor) -> torch.Tensor:
+        return self.stem(condition)
+
+    def inject_skip(self, encoded: torch.Tensor, index: int, target: torch.Tensor) -> torch.Tensor:
+        resized = F.interpolate(encoded, size=target.shape[-2:], mode="bilinear", align_corners=False)
+        return self.skip_projections[index](resized)
+
+    def inject_middle(self, encoded: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        resized = F.interpolate(encoded, size=target.shape[-2:], mode="bilinear", align_corners=False)
+        return self.middle_projection(resized)
+
+
 class UNet(nn.Module):
     """
     TODO: design your own U-Net architecture for diffusion models.
@@ -74,6 +108,9 @@ class UNet(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         use_scale_shift_norm: bool = True,
+        conditioning_mode: str = "concat",
+        condition_channels: int = 3,
+        edge_adapter_hidden_channels: int = 64,
     ):
         super().__init__()
         
@@ -86,6 +123,14 @@ class UNet(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.conditioning_mode = conditioning_mode
+        self.condition_channels = condition_channels
+
+        if self.conditioning_mode not in {"concat", "edge_adapter"}:
+            raise ValueError(
+                f"Unsupported conditioning_mode '{self.conditioning_mode}'. "
+                "Expected one of: ['concat', 'edge_adapter']"
+            )
 
         # Input and Time
 
@@ -145,6 +190,15 @@ class UNet(nn.Module):
             AttentionBlock(ch, num_heads),
             ResBlock(ch, ch, time_embed_dim, dropout, use_scale_shift_norm),
         ])
+
+        self.edge_adapter: Optional[EdgeAdapter] = None
+        if self.conditioning_mode == "edge_adapter":
+            self.edge_adapter = EdgeAdapter(
+                condition_channels=condition_channels,
+                hidden_channels=edge_adapter_hidden_channels,
+                skip_channels=self.input_block_chans,
+                middle_channels=ch,
+            )
         
         # =====================================================================
         # Upsampling path (decoder)
@@ -199,7 +253,12 @@ class UNet(nn.Module):
             nn.Conv2d(ch, out_channels, kernel_size=3, padding=1),
         )
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Forward pass of the UNet.
         
@@ -214,13 +273,35 @@ class UNet(nn.Module):
         # Compute time embedding
         t_emb = self.time_embed(t)
         
+        cond_encoded: Optional[torch.Tensor] = None
+        if self.conditioning_mode == "edge_adapter":
+            if condition is None:
+                condition = x.new_zeros((x.shape[0], self.condition_channels, x.shape[2], x.shape[3]))
+            if condition.shape[0] != x.shape[0]:
+                raise ValueError(
+                    f"Condition batch ({condition.shape[0]}) must match input batch ({x.shape[0]})."
+                )
+            if condition.shape[1] != self.condition_channels:
+                raise ValueError(
+                    f"Condition channels ({condition.shape[1]}) must match "
+                    f"condition_channels ({self.condition_channels})."
+                )
+            if condition.shape[-2:] != x.shape[-2:]:
+                condition = F.interpolate(
+                    condition, size=x.shape[-2:], mode="bilinear", align_corners=False
+                )
+            cond_encoded = self.edge_adapter.encode(condition)
+
         # Initial convolution
         h = self.head(x)
-        
+        if cond_encoded is not None:
+            h = h + self.edge_adapter.inject_skip(cond_encoded, 0, h)
+
         # =====================================================================
         # Downsampling path - collect skip connections
         # =====================================================================
         skips = [h]
+        skip_index = 1
         for block in self.down_blocks:
             if isinstance(block, Downsample):
                 h = block(h)
@@ -231,11 +312,16 @@ class UNet(nn.Module):
                         h = layer(h, t_emb)
                     else:
                         h = layer(h)
+            if cond_encoded is not None:
+                h = h + self.edge_adapter.inject_skip(cond_encoded, skip_index, h)
+            skip_index += 1
             skips.append(h)
-        
+
         # =====================================================================
         # Middle block
         # =====================================================================
+        if cond_encoded is not None:
+            h = h + self.edge_adapter.inject_middle(cond_encoded, h)
         for layer in self.middle_block:
             if isinstance(layer, ResBlock):
                 h = layer(h, t_emb)
@@ -289,6 +375,9 @@ def create_model_from_config(config: dict) -> UNet:
         num_heads=model_config['num_heads'],
         dropout=model_config['dropout'],
         use_scale_shift_norm=model_config['use_scale_shift_norm'],
+        conditioning_mode=model_config.get('conditioning_mode', 'concat'),
+        condition_channels=model_config.get('condition_channels', data_config['channels']),
+        edge_adapter_hidden_channels=model_config.get('edge_adapter_hidden_channels', 64),
     )
 
 

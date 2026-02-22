@@ -34,7 +34,6 @@ image = (
         "tqdm>=4.64.0",
         "scipy>=1.9.0",
         "opencv-python-headless>=4.0.0",
-        "controlnet-aux>=0.0.9",
         "wandb>=0.15.0",
         "datasets>=2.0.0",  # For HuggingFace Hub dataset loading
         "torch-fidelity>=0.3.0",  # Comprehensive evaluation metrics
