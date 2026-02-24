@@ -35,6 +35,7 @@ image = (
         "gradio>=4.0.0",
         "fastapi[standard]>=0.100.0",
         "slowapi>=0.1.9",
+        "lpips",
     )
     .add_local_dir(
         ".",
@@ -51,8 +52,8 @@ volume = modal.Volume.from_name("cmu-10799-diffusion-data", create_if_missing=Tr
 DATA_DIR = "/data"
 
 # ── Checkpoints directories on the volume (under DATA_DIR). Latest flow_matching_*.pt is chosen from each.
-CANNY_CHECKPOINTS_DIR = "logs/hw4_edge_canny2_only/flow_matching_20260221_082439/checkpoints"
-XDOG_CHECKPOINTS_DIR = "logs/hw4_edge_xdog028_eagf_modal_2gpu/flow_matching_20260221_152822/checkpoints"
+CANNY_CHECKPOINTS_DIR = "logs/hw4_edge_adapter_canny_mix_eagf_modal_2gpu/flow_matching_20260223_223809/checkpoints"
+# XDOG_CHECKPOINTS_DIR = "logs/hw4_edge_xdog028_eagf_modal_2gpu/flow_matching_20260221_152822/checkpoints"  # XDoG commented out for now
 
 
 def find_latest_checkpoint(
@@ -256,10 +257,26 @@ def build_demo(models: dict, default_steps: int):
     from PIL import Image as PILImage
     from src.data import unnormalize
 
-    choices = [k for k in ("Canny", "XDoG") if k.lower() in models]
+    choices = [k for k in ("Canny",) if k.lower() in models]  # XDoG commented out for now
     first_choice = choices[0] if choices else "Canny"
 
-    def generate(sketch_editor_value, edge_model: str, num_steps: int, seed: int):
+    def _default_cfg_for_model(edge_model: str) -> float:
+        key = edge_model.lower()
+        if key not in models:
+            key = first_choice.lower()
+        method, _, _ = models[key]
+        return float(getattr(method, "cfg_guidance_scale", 1.0))
+
+    def _sync_cfg_slider(edge_model: str):
+        return gr.update(value=_default_cfg_for_model(edge_model))
+
+    def generate(
+        sketch_editor_value,
+        edge_model: str,
+        num_steps: int,
+        guidance_scale: float,
+        seed: int,
+    ):
         key = edge_model.lower()
         if key not in models:
             key = first_choice.lower()
@@ -288,6 +305,7 @@ def build_demo(models: dict, default_steps: int):
                 image_shape=image_shape,
                 num_steps=int(num_steps),
                 condition=cond,
+                guidance_scale=float(guidance_scale),
             )
 
         out = unnormalize(samples)
@@ -298,81 +316,117 @@ def build_demo(models: dict, default_steps: int):
 
     black_bg = PILImage.new("RGB", (512, 512), (0, 0, 0))
 
-    with gr.Blocks(title="Sketch → Face (Canny / XDoG)") as demo:
+    def clear_sketch():
+        """Reset sketchpad to black background (not white)."""
+        reset = PILImage.new("RGB", (512, 512), (0, 0, 0))
+        return gr.update(value={
+            "background": reset,
+            "layers": [],
+            "composite": reset,
+        })
+
+    def apply_max_perceptual_qual():
+        """Preset: lowest CFG and sampling steps for max perceptual quality."""
+        return gr.update(value=10), gr.update(value=1.0)
+
+    CANVAS_SIZE = 512
+
+    with gr.Blocks(
+        title="Sketch → Face (Canny / XDoG)",
+        fill_width=True,
+        head="<meta name='viewport' content='width=device-width, initial-scale=1'>",
+    ) as demo:
         gr.Markdown(
             """
-            # Sketch → Face (Canny / XDoG)
-            Draw white edge strokes on the black canvas, pick **Edge model** (Canny or XDoG), then click **Generate**.
-
-            The same white-on-black sketch is used for both; the dropdown selects which trained model runs.
+            # Sketch → Face
+            Draw white edge strokes on the black canvas, then click **Generate**.
             """
         )
 
+        # Compact top bar: controls in one row
+        with gr.Row(variant="compact"):
+            edge_radio = gr.Radio(
+                label="Edge model",
+                choices=choices,
+                value=first_choice,
+            )
+            num_steps_slider = gr.Slider(
+                minimum=10,
+                maximum=100,
+                step=5,
+                value=10,
+                label="Steps",
+            )
+            guidance_scale_slider = gr.Slider(
+                minimum=1.0,
+                maximum=10.0,
+                step=0.5,
+                value=1.0,
+                label="CFG",
+            )
+            preset_btn = gr.Button("Max perceptual qual", variant="secondary")
+            clear_btn = gr.Button("Clear drawing", variant="secondary")
+            generate_btn = gr.Button("Generate face", variant="primary", size="lg")
+        with gr.Accordion("Advanced", open=False):
+            seed_slider = gr.Slider(
+                minimum=-1,
+                maximum=9999,
+                step=1,
+                value=42,
+                label="Seed  (-1 = random)",
+            )
+
+        # Main content: sketch | output
         with gr.Row():
-            with gr.Column(scale=1):
-                edge_radio = gr.Radio(
-                    label="Edge model",
-                    choices=choices,
-                    value=first_choice,
-                )
-                sketch_input = gr.Sketchpad(
-                    label="Draw your face sketch here (white on black)",
-                    canvas_size=(512, 512),
-                    height=512,
-                    width=512,
-                    type="pil",
-                    image_mode="RGB",
-                    brush=gr.Brush(
-                        colors=["#FFFFFF"],
-                        color_mode="fixed",
-                        default_color="#FFFFFF",
-                    ),
-                    value={
-                        "background": black_bg,
-                        "layers": [],
-                        "composite": black_bg,
-                    },
-                )
-                with gr.Row():
-                    num_steps_slider = gr.Slider(
-                        minimum=10,
-                        maximum=100,
-                        step=5,
-                        value=default_steps,
-                        label="Sampling steps",
-                    )
-                    seed_slider = gr.Slider(
-                        minimum=-1,
-                        maximum=9999,
-                        step=1,
-                        value=42,
-                        label="Seed  (-1 = random)",
-                    )
-                generate_btn = gr.Button("Generate face", variant="primary", size="lg")
+            sketch_input = gr.Sketchpad(
+                label="Draw your face sketch (white on black)",
+                canvas_size=(512, 512),
+                height=CANVAS_SIZE,
+                width=CANVAS_SIZE,
+                type="pil",
+                image_mode="RGB",
+                brush=gr.Brush(
+                    colors=["#FFFFFF"],
+                    color_mode="fixed",
+                    default_color="#FFFFFF",
+                ),
+                value={
+                    "background": black_bg,
+                    "layers": [],
+                    "composite": black_bg,
+                },
+            )
+            output_image = gr.Image(
+                label="Generated face",
+                type="pil",
+                height=CANVAS_SIZE,
+                width=CANVAS_SIZE,
+            )
 
-            with gr.Column(scale=1):
-                output_image = gr.Image(
-                    label="Generated face (64×64 upscaled to 512×512)",
-                    type="pil",
-                    height=512,
-                    width=512,
-                )
-                gr.Markdown("_Model outputs 64×64; upscaled to 512×512 for display._")
-
+        edge_radio.change(
+            fn=_sync_cfg_slider,
+            inputs=edge_radio,
+            outputs=guidance_scale_slider,
+        )
+        preset_btn.click(
+            fn=apply_max_perceptual_qual,
+            outputs=[num_steps_slider, guidance_scale_slider],
+            queue=False,
+        )
+        clear_btn.click(fn=clear_sketch, outputs=sketch_input)
         generate_btn.click(
             fn=generate,
-            inputs=[sketch_input, edge_radio, num_steps_slider, seed_slider],
+            inputs=[sketch_input, edge_radio, num_steps_slider, guidance_scale_slider, seed_slider],
             outputs=output_image,
         )
 
-        gr.Markdown(
-            """
-            ---
-            **Architecture:** UNet (6-ch input = 3-ch noisy image + 3-ch edge map)  |
-            **Method:** Flow Matching, Euler steps  |
-            **Models:** Canny (40K steps, 2× L40S) and/or XDoG (20K steps, 4× L40S), CelebA 64×64
-            """
-        )
+        with gr.Accordion("Details", open=False):
+            gr.Markdown(
+                """
+                **Architecture:** UNet (6-ch input = 3-ch noisy image + 3-ch edge map)  |
+                **Method:** Flow Matching, Euler steps  |  **Models:** Canny, CelebA 64×64
+                """
+            )
 
     return demo
 
@@ -429,13 +483,14 @@ def ui():
     ckpt_canny = find_latest_in_checkpoints_dir(DATA_DIR, CANNY_CHECKPOINTS_DIR) or find_latest_checkpoint(
         DATA_DIR, subdir_contains="edge_canny"
     )
-    ckpt_xdog = find_latest_in_checkpoints_dir(DATA_DIR, XDOG_CHECKPOINTS_DIR) or find_latest_checkpoint(
-        DATA_DIR,
-        subdir_contains="edge_flow_matching",
-        subdir_excludes="edge_canny",
-    )
+    # XDoG commented out for now
+    # ckpt_xdog = find_latest_in_checkpoints_dir(DATA_DIR, XDOG_CHECKPOINTS_DIR) or find_latest_checkpoint(
+    #     DATA_DIR,
+    #     subdir_contains="edge_flow_matching",
+    #     subdir_excludes="edge_canny",
+    # )
 
-    if ckpt_canny is None and ckpt_xdog is None:
+    if ckpt_canny is None:
         with gr.Blocks(title="No checkpoint found") as err_demo:
             gr.Markdown(
                 f"""
@@ -466,12 +521,13 @@ def ui():
         default_steps = steps
         print(f"[demo] Canny model ready | image_shape={image_shape} | default_steps={steps}")
 
-    if ckpt_xdog:
-        method, image_shape, steps = load_model(ckpt_xdog, device)
-        models["xdog"] = (method, image_shape, steps)
-        if "canny" not in models:
-            default_steps = steps
-        print(f"[demo] XDoG model ready | image_shape={image_shape} | default_steps={steps}")
+    # XDoG commented out for now
+    # if ckpt_xdog:
+    #     method, image_shape, steps = load_model(ckpt_xdog, device)
+    #     models["xdog"] = (method, image_shape, steps)
+    #     if "canny" not in models:
+    #         default_steps = steps
+    #     print(f"[demo] XDoG model ready | image_shape={image_shape} | default_steps={steps}")
 
     demo = build_demo(models, default_steps)
     fast_app = make_fastapi_app()

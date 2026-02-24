@@ -37,6 +37,7 @@ image = (
         "wandb>=0.15.0",
         "datasets>=2.0.0",  # For HuggingFace Hub dataset loading
         "torch-fidelity>=0.3.0",  # Comprehensive evaluation metrics
+        "lpips>=0.1.4",           # Perceptual loss (PixelGen, arXiv 2602.02493)
     )
     # Copy the local project directory into the image
     .add_local_dir(".", "/root", ignore=[".git", ".venv*", "venv", "__pycache__", "logs", "checkpoints", "*.md", "docs", "environments", "notebooks"])

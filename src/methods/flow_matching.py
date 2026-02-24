@@ -22,6 +22,9 @@ class FlowMatching(BaseMethod):
         edge_cycle_loss_weight: float = 0.0,
         contrastive_loss_weight: float = 0.0,
         contrastive_margin: float = 0.02,
+        # HW4: perceptual loss (PixelGen, arXiv 2602.02493)
+        perceptual_loss_weight: float = 0.0,
+        perceptual_loss_t_min: float = 0.3,
         # HW4: sampling-time CFG controls
         cfg_guidance_scale: float = 1.0,
         cfg_zero_steps: int = 0,
@@ -34,6 +37,8 @@ class FlowMatching(BaseMethod):
         self.edge_cycle_loss_weight = edge_cycle_loss_weight
         self.contrastive_loss_weight = contrastive_loss_weight
         self.contrastive_margin = contrastive_margin
+        self.perceptual_loss_weight = perceptual_loss_weight
+        self.perceptual_loss_t_min = perceptual_loss_t_min
         self.cfg_guidance_scale = cfg_guidance_scale
         self.cfg_zero_steps = cfg_zero_steps
 
@@ -45,6 +50,8 @@ class FlowMatching(BaseMethod):
             raise ValueError("edge_cycle_loss_weight must be >= 0.")
         if self.contrastive_loss_weight < 0:
             raise ValueError("contrastive_loss_weight must be >= 0.")
+        if self.perceptual_loss_weight < 0:
+            raise ValueError("perceptual_loss_weight must be >= 0.")
         if self.cfg_guidance_scale < 0:
             raise ValueError("cfg_guidance_scale must be >= 0.")
         if self.cfg_zero_steps < 0:
@@ -61,6 +68,25 @@ class FlowMatching(BaseMethod):
         ).unsqueeze(0)
         self.register_buffer("sobel_x", sobel_x, persistent=False)
         self.register_buffer("sobel_y", sobel_y, persistent=False)
+
+        # LPIPS perceptual loss network (frozen VGG, not saved in checkpoints).
+        # Registered as a submodule so .to(device) moves it correctly.
+        # Its parameters are excluded from the optimizer because BaseMethod.parameters()
+        # returns self.model.parameters() (the UNet only).
+        lpips_net = None
+        if self.perceptual_loss_weight > 0.0:
+            try:
+                import lpips as lpips_lib
+            except ImportError:
+                raise ImportError(
+                    "lpips is required when perceptual_loss_weight > 0. "
+                    "Install with: pip install lpips"
+                )
+            lpips_net = lpips_lib.LPIPS(net="vgg", verbose=False)
+            lpips_net.eval()
+            for p in lpips_net.parameters():
+                p.requires_grad_(False)
+        self.register_module("lpips_fn", lpips_net)
 
         self.to(device)
 
@@ -143,16 +169,41 @@ class FlowMatching(BaseMethod):
             "mse": mse.detach(),
         }
 
+        # Compute predicted clean image x_1_hat = x_t + (1-t)*v_theta once.
+        # Derivation: x_t = (1-t)*x_0 + t*x_1, v = x_1 - x_0
+        #   → x_1 = x_t + (1-t)*v  (exact when v = v_target)
+        # Used by both cycle and perceptual losses. Only computed when needed.
+        needs_x1_hat = (
+            (self.edge_cycle_loss_weight > 0.0 and condition is not None)
+            or self.perceptual_loss_weight > 0.0
+        )
+        x_1_hat = x_t + (1.0 - t_reshaped) * v_theta if needs_x1_hat else None
+
         # Optional: edge cycle consistency loss.
         if self.edge_cycle_loss_weight > 0.0 and condition is not None:
-            # From x_t = (1-t)x_0 + t x_1 and v = x_1 - x_0:
-            # x_1_hat = x_t + (1-t) * v_theta
-            x_1_hat = x_t + (1.0 - t_reshaped) * v_theta
             pred_edges = self._sobel_edge_map(x_1_hat)
             cond_edges = ((condition + 1.0) * 0.5).mean(dim=1, keepdim=True)
             edge_cycle = F.l1_loss(pred_edges, cond_edges)
             total_loss = total_loss + self.edge_cycle_loss_weight * edge_cycle
             metrics["edge_cycle"] = edge_cycle.detach()
+
+        # Optional: LPIPS perceptual loss, adapted from PixelGen (arXiv 2602.02493).
+        # Applied only for t > perceptual_loss_t_min to avoid the high-noise regime
+        # where x_1_hat is an unreliable estimate of the clean image.
+        # Gradient flows: LPIPS(x_1_hat, x_1) → x_1_hat → v_theta → UNet weights.
+        # LPIPS network weights are frozen (requires_grad=False) and not in the optimizer.
+        if self.perceptual_loss_weight > 0.0 and self.lpips_fn is not None:
+            # Mask: only include samples where t is far enough from the noise end.
+            # In our convention t=0 is noise, t=1 is data; unreliable when t < t_min.
+            t_mask = (t > self.perceptual_loss_t_min).float()  # (B,)
+            n_active = t_mask.sum()
+            if n_active > 0:
+                # x_1_hat and x_1 are both in [-1, 1] (CelebA normalization).
+                # lpips_fn returns (B, 1, 1, 1); flatten to (B,) for masked mean.
+                lpips_vals = self.lpips_fn(x_1_hat, x_1)  # (B, 1, 1, 1)
+                perceptual = (lpips_vals.view(batch_size) * t_mask).sum() / n_active
+                total_loss = total_loss + self.perceptual_loss_weight * perceptual
+                metrics["perceptual"] = perceptual.detach()
 
         # Optional: simple contrastive condition separation term.
         if self.contrastive_loss_weight > 0.0 and condition is not None and batch_size > 1:
@@ -247,6 +298,8 @@ class FlowMatching(BaseMethod):
             edge_cycle_loss_weight=float(fm_config.get("edge_cycle_loss_weight", 0.0)),
             contrastive_loss_weight=float(fm_config.get("contrastive_loss_weight", 0.0)),
             contrastive_margin=float(fm_config.get("contrastive_margin", 0.02)),
+            perceptual_loss_weight=float(fm_config.get("perceptual_loss_weight", 0.0)),
+            perceptual_loss_t_min=float(fm_config.get("perceptual_loss_t_min", 0.3)),
             cfg_guidance_scale=float(fm_config.get("cfg_guidance_scale", 1.0)),
             cfg_zero_steps=int(fm_config.get("cfg_zero_steps", 0)),
         )
