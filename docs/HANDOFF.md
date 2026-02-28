@@ -1,0 +1,138 @@
+# Handoff Summary (HW3 + HW4)
+
+## 1) Current Snapshot
+- Repo: `cmu-10799-diffusion`
+- Current branch: `hw4` (tracking `origin/hw4`)
+- Latest pushed commit: `e719016`
+- Recent logbook entry: `docs/LOGBOOK.md`
+- Core trajectory:
+  - HW1/HW2 foundation (DDPM, UNet, training/sampling infra)
+  - HW3 conditional sketch-to-face with Flow Matching
+  - HW4 stronger conditioning, edge-mix strategy, adapter-based conditioning, and edge experiments
+
+
+## 2) What HW3 Covers in This Repo
+- Primary HW3 model family is conditional Flow Matching with sketch/edge conditioning.
+- Typical HW3 configs are:
+  - `configs/edge_flow_matching_modal.yaml`
+  - `configs/edge_flow_matching_modal_4gpu.yaml`
+  - `configs/edge_flow_matching_modal_110k.yaml`
+  - `configs/edge_canny_flow_matching_modal_2gpu.yaml`
+  - `configs/edge_canny_flow_matching_modal_4gpu.yaml`
+- HW3 training/eval orchestration uses:
+  - `train.py` (core training loop)
+  - `sample.py` (sampling/generation)
+  - `modal_app.py` (Modal entrypoints, multi-GPU routing, eval pipeline)
+  - `final_evals.py` (Q7 sampling-step ablation launcher)
+
+
+## 3) What HW4 Adds (Current State)
+- Conditioning improvements in Flow Matching (`src/methods/flow_matching.py`):
+  - timestep-dependent condition weighting
+  - condition dropout for CFG-style training
+  - edge cycle consistency loss
+  - simple contrastive mismatch term
+  - CFG and CFG-zero behavior at sampling time
+- New model conditioning mode in UNet (`src/models/unet.py`):
+  - `conditioning_mode: concat` (existing path)
+  - `conditioning_mode: edge_adapter` (new path)
+  - `EdgeAdapter` injects condition features at skip levels + middle block
+- Data/conditioning pipeline updates (`src/data/celeba.py`):
+  - focus on Canny + XDoG
+  - mixed edge generation with Dirichlet weights
+  - optional per-method alpha weighting
+  - `method:sigma` syntax support in edge mix lists (e.g., `xdog:0.28`, `canny:1.2`)
+  - mushy-style augmentations (dropout/blur/morph/binary)
+- New HW4 config family:
+  - Mixed baseline:
+    - `configs/hw4_edge_mixed_baseline_modal_2gpu.yaml`
+    - `configs/hw4_edge_mixed_baseline_modal_1gpu_dryrun.yaml`
+  - Mixed + EAGF-style losses/guidance:
+    - `configs/hw4_edge_mixed_eagf_modal_2gpu.yaml`
+    - `configs/hw4_edge_mixed_eagf_modal_1gpu_dryrun.yaml`
+  - Edge adapter variants:
+    - `configs/hw4_edge_adapter_mixed_baseline_modal_2gpu.yaml`
+    - `configs/hw4_edge_adapter_mixed_baseline_modal_1gpu_dryrun.yaml`
+    - `configs/hw4_edge_adapter_mixed_eagf_modal_2gpu.yaml`
+    - `configs/hw4_edge_adapter_mixed_eagf_modal_1gpu_dryrun.yaml`
+  - Single-detector tuned runs:
+    - `configs/hw4_edge_canny2_only.yaml`
+    - `configs/hw4_edge_xdog028_eagf_modal_2gpu.yaml`
+
+
+## 4) Where to Go for What
+- Training loop + logging + DDP + checkpointing:
+  - `train.py`
+- Sampling from checkpoint (grid/individual, optional condition source):
+  - `sample.py`
+- Modal cloud orchestration (actions: download/train/sample/evaluate):
+  - `modal_app.py`
+- Model architecture:
+  - `src/models/unet.py`
+  - building blocks in `src/models/blocks.py`
+- Methods:
+  - DDPM: `src/methods/ddpm.py`
+  - Flow Matching: `src/methods/flow_matching.py`
+- Data and edge preprocessing:
+  - `src/data/celeba.py`
+  - module exports: `src/data/__init__.py`
+- Demo app (sketch -> face):
+  - `gradio_demo.py`
+- Edge experiments / visual studies:
+  - `experiments/full_edge_compare_v2.py`
+  - `experiments/edge_compare_extended.py`
+  - `experiments/hw4_sample_grid_10.py`
+  - `experiments/viz_binarized_xdog.py`
+  - `scripts/visualize_edge_grid.py`
+- Docs + setup:
+  - `README.md`
+  - `docs/SETUP.md`
+  - `docs/QUICKSTART-MODAL.md`
+  - `docs/DIRECTORY-STRUCTURE.md`
+  - `docs/LOGBOOK.md`
+
+
+## 5) Runbook (Most Useful Commands)
+- Local train:
+  - `python train.py --method flow_matching --config configs/hw4_edge_mixed_eagf_modal_2gpu.yaml`
+- Local sample:
+  - `python sample.py --checkpoint <path_to_ckpt.pt> --method flow_matching --num_samples 64 --grid`
+- Modal data cache (one-time):
+  - `modal run modal_app.py --action download`
+- Modal train:
+  - `modal run modal_app.py --action train --method flow_matching --config configs/hw4_edge_mixed_eagf_modal_2gpu.yaml`
+- Modal sample:
+  - `modal run modal_app.py --action sample --method flow_matching --checkpoint logs/<run>/checkpoints/flow_matching_final.pt --num_samples 16`
+- Modal eval:
+  - `modal run modal_app.py --action evaluate --method flow_matching --checkpoint logs/<run>/checkpoints/flow_matching_final.pt --metrics fid,kid`
+
+
+## 6) Data, Logs, Checkpoints
+- Local defaults come from config files (`checkpoint.dir`, `logging.dir`).
+- In Modal runs, paths are rewritten to `/data/...` in `modal_app.py`.
+- Typical Modal layout:
+  - `/data/celeba` (cached dataset)
+  - `/data/logs/<config_tag>/<method_timestamp>/...`
+  - `/data/checkpoints/<config_tag>/...`
+  - `/data/hw3_answers/<config_tag>/training_summary.json` (summary generated by training wrapper)
+
+
+## 7) Current Progress and Practical Status
+- HW3 stack is stable and already used for training/sampling/evaluation workflows.
+- HW4 code path is integrated end-to-end:
+  - data -> method loss terms -> model conditioning path -> sampling -> Modal/demo wiring
+- New edge-comparison outputs and experiment scripts are committed and pushed.
+- Gradio demo is wired to selected Canny/XDoG checkpoint directories in `gradio_demo.py`.
+
+
+## 8) Known Caveats / Hygiene Notes
+- `README.md` and older comments still mention starter TODO language from early assignments; actual code is much more advanced.
+- Some generated artifacts and detector vendor files are committed (including `src/edge_detectors/...` and output images), so repo size/noise is higher.
+- `src/edge_detectors` currently looks vendored/experimental; main training data pipeline currently uses Canny/XDoG in `src/data/celeba.py`.
+
+
+## 9) Suggested Next Work (If Continuing HW4)
+- Consolidate to a small set of “official” HW4 configs (baseline, EAGF, adapter) and mark deprecated ones.
+- Record best checkpoints + metrics in one summary table (config, step, FID/KID, qualitative notes).
+- Clean up committed cache-like files (`__pycache__` / heavy outputs) if desired for a lighter repo.
+- Add a focused `docs/HW4.md` for final report reproducibility (exact commands + expected outputs).

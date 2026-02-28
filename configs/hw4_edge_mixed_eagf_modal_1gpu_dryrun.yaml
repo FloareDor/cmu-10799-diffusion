@@ -1,0 +1,79 @@
+data:
+  dataset: celeba
+  root: "/data/celeba"
+  from_hub: true
+  repo_name: "electronickale/cmu-10799-celeba64-subset"
+  image_size: 64
+  channels: 3
+  num_workers: 0
+  pin_memory: true
+  augment: true
+  conditional: true
+  edge_method: mixed
+  edge_mix_methods: ["xdog:0.28", "canny:2.3", "canny:2", "canny:1.75", "canny:1.5", "canny:1.2", "canny:1.0"]
+  edge_mix_alpha: 1.0
+  edge_mix_alpha_per_method: [6, 1, 1, 1, 1, 1, 1]  # 50% XDoG, 50% six Canny combined
+  edge_mix_canny_low: 80
+  edge_mix_canny_high: 200
+  edge_mix_binary_prob: 0.35
+  edge_mix_dropout_prob: 0.05
+  edge_mix_blur_prob: 0.20
+  edge_mix_morph_prob: 0.20
+  edge_mix_canny_sigma: 1.2
+  edge_mix_xdog_sigma: 0.29
+
+model:
+  in_channels: 6
+  base_channels: 128
+  channel_mult: [1, 2, 2, 4]
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+  num_heads: 4
+  dropout: 0.1
+  use_scale_shift_norm: true
+
+training:
+  batch_size: 8
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  ema_decay: 0.9999
+  ema_start: 2000
+  gradient_clip_norm: 1.0
+  num_iterations: 3
+  log_every: 1
+  sample_every: 999999
+  save_every: 999999
+  num_samples: 4
+
+flow_matching:
+  num_timesteps: 1000
+  enable_timestep_edge_weighting: true
+  edge_weight_power: 1.0
+  condition_dropout_prob: 0.12
+  edge_cycle_loss_weight: 0.10
+  contrastive_loss_weight: 0.05
+  contrastive_margin: 0.02
+  cfg_guidance_scale: 2.5
+  cfg_zero_steps: 8
+
+sampling:
+  num_steps: 20
+
+infrastructure:
+  seed: 42
+  device: cuda
+  num_gpus: 1
+  mixed_precision: false
+  compile_model: false
+
+checkpoint:
+  dir: "./checkpoints"
+  resume: null
+
+logging:
+  dir: "./logs"
+  wandb:
+    enabled: true
+    project: "cmu-10799-hw4"
+    entity: null
