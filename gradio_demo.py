@@ -14,9 +14,9 @@ URL: https://{workspace}--sketch-to-face-combined-ui.modal.run
 
 import modal
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ?????????????????????????????????????????????????????????????????????????????
 # Modal App + Image
-# ─────────────────────────────────────────────────────────────────────────────
+# ?????????????????????????????????????????????????????????????????????????????
 
 app = modal.App("sketch-to-face-combined")
 
@@ -51,9 +51,12 @@ image = (
 volume = modal.Volume.from_name("cmu-10799-diffusion-data", create_if_missing=True)
 DATA_DIR = "/data"
 
-# ── Checkpoints directories on the volume (under DATA_DIR). Latest flow_matching_*.pt is chosen from each.
-CANNY_CHECKPOINTS_DIR = "logs/hw4_edge_adapter_canny_mix_eagf_modal_2gpu/flow_matching_20260223_223809/checkpoints"
-# XDOG_CHECKPOINTS_DIR = "logs/hw4_edge_xdog028_eagf_modal_2gpu/flow_matching_20260221_152822/checkpoints"  # XDoG commented out for now
+# ?? Checkpoints directories on the volume (under DATA_DIR). Latest flow_matching_*.pt is chosen from each.
+BASELINE_CHECKPOINTS_DIR = "logs/edge_canny_flow_matching_modal_2gpu/flow_matching_20260217_225006/checkpoints"
+BASELINE_BGAUG_CHECKPOINTS_DIR = "logs/hw4_noadapter_canny_mix_eagf_geomaug_precomputedbg_modal_4gpu_fastfull/flow_matching_20260226_111048/checkpoints"
+CANNY_CHECKPOINTS_DIR = "logs/hw4_edge_adapter_canny_mix_eagf_geomaug_precomputedbg_modal_2gpu_canny10_no23/flow_matching_20260225_031235/checkpoints"
+XDOG_CHECKPOINTS_DIR = "logs/hw4_edge_xdog028_eagf_modal_2gpu/flow_matching_20260221_152822/checkpoints"
+XDOG_BGAUG_CHECKPOINTS_DIR = "logs/hw4_edge_adapter_xdog028_eagf_geomaug_precomputedbg_modal_2gpu/flow_matching_20260226_091124/checkpoints"
 
 
 def find_latest_checkpoint(
@@ -182,9 +185,9 @@ def load_model(checkpoint_path: str, device):
     return method, image_shape, default_steps
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ?????????????????????????????????????????????????????????????????????????????
 # Preprocessing: Canny vs XDoG
-# ─────────────────────────────────────────────────────────────────────────────
+# ?????????????????????????????????????????????????????????????????????????????
 
 def preprocess_sketch_canny(sketch_pil, image_size: int):
     """
@@ -213,7 +216,7 @@ def preprocess_sketch_xdog(sketch_pil, image_size: int):
     XDoG model: pass the user's white-on-black sketch through directly.
 
     The model was trained on XDoG edges which are white edges on a black
-    background — identical in format to what the user draws. No filter is
+    background ? identical in format to what the user draws. No filter is
     applied here; we just resize and normalize.
     """
     import numpy as np
@@ -234,20 +237,31 @@ def preprocess_sketch_xdog(sketch_pil, image_size: int):
     return to_tensor(sketch_resized).unsqueeze(0)
 
 
-# Map UI label -> (preprocess_fn, key in models dict)
+# Map UI label -> preprocess_fn. Model key is from EDGE_MODEL_DISPLAY_TO_KEY.
 PREPROCESSORS = {
-    "Canny": preprocess_sketch_canny,
+    "Baseline": preprocess_sketch_canny,
+    "baseline (+bg +aug)": preprocess_sketch_canny,
+    "Best Canny": preprocess_sketch_canny,
     "XDoG": preprocess_sketch_xdog,
+    "xdog (+bg+aug)": preprocess_sketch_xdog,
+}
+# UI display name -> key in models dict
+EDGE_MODEL_DISPLAY_TO_KEY = {
+    "Baseline": "baseline",
+    "baseline (+bg +aug)": "baseline_bgaug",
+    "Best Canny": "canny",
+    "XDoG": "xdog",
+    "xdog (+bg+aug)": "xdog_bgaug",
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ?????????????????????????????????????????????????????????????????????????????
 # Gradio UI
-# ─────────────────────────────────────────────────────────────────────────────
+# ?????????????????????????????????????????????????????????????????????????????
 
 def build_demo(models: dict, default_steps: int):
     """
-    Build combined demo. models: {"canny": (method, image_shape, steps), "xdog": ...}
+    Build combined demo.
     Only keys for available models are present.
     """
     import gradio as gr
@@ -257,13 +271,17 @@ def build_demo(models: dict, default_steps: int):
     from PIL import Image as PILImage
     from src.data import unnormalize
 
-    choices = [k for k in ("Canny",) if k.lower() in models]  # XDoG commented out for now
-    first_choice = choices[0] if choices else "Canny"
+    choices = [
+        name
+        for name in ("Baseline", "baseline (+bg +aug)", "Best Canny", "XDoG", "xdog (+bg+aug)")
+        if EDGE_MODEL_DISPLAY_TO_KEY[name] in models
+    ]
+    first_choice = choices[0] if choices else "Baseline"
 
     def _default_cfg_for_model(edge_model: str) -> float:
-        key = edge_model.lower()
+        key = EDGE_MODEL_DISPLAY_TO_KEY.get(edge_model, edge_model.lower())
         if key not in models:
-            key = first_choice.lower()
+            key = EDGE_MODEL_DISPLAY_TO_KEY.get(first_choice, first_choice.lower())
         method, _, _ = models[key]
         return float(getattr(method, "cfg_guidance_scale", 1.0))
 
@@ -277,9 +295,9 @@ def build_demo(models: dict, default_steps: int):
         guidance_scale: float,
         seed: int,
     ):
-        key = edge_model.lower()
+        key = EDGE_MODEL_DISPLAY_TO_KEY.get(edge_model, edge_model.lower())
         if key not in models:
-            key = first_choice.lower()
+            key = EDGE_MODEL_DISPLAY_TO_KEY.get(first_choice, first_choice.lower())
         method, image_shape, _ = models[key]
         preprocess_fn = PREPROCESSORS[edge_model] if edge_model in PREPROCESSORS else PREPROCESSORS[first_choice]
 
@@ -329,16 +347,113 @@ def build_demo(models: dict, default_steps: int):
         """Preset: lowest CFG and sampling steps for max perceptual quality."""
         return gr.update(value=10), gr.update(value=1.0)
 
+    def save_sketch_64x64(sketch_editor_value):
+        """Export the current sketch as 64x64 PNG so the browser can download it locally."""
+        import tempfile
+        from datetime import datetime
+        sketch_pil = None
+        if sketch_editor_value is not None:
+            if isinstance(sketch_editor_value, dict):
+                sketch_pil = sketch_editor_value.get("composite")
+            elif hasattr(sketch_editor_value, "convert"):
+                sketch_pil = sketch_editor_value
+        if sketch_pil is None:
+            sketch_pil = PILImage.new("RGB", (512, 512), (0, 0, 0))
+        sketch_64 = sketch_pil.convert("RGB").resize((64, 64), PILImage.BILINEAR)
+        filename = f"my_sketch_64x64_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            sketch_64.save(f.name)
+            return (f.name, filename)
+
     CANVAS_SIZE = 512
 
+    # Mobile: prevent touch from being used for scroll so canvas gets draw events
+    _css = """
+    #sketch-pad { touch-action: none; }
+    #sketch-pad canvas { touch-action: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+    """
+    # When in-canvas trash is clicked, trigger our Clear button so canvas resets to black (not white)
+    # On iPad: close brush-size popover when tapping outside or on the same button (tap-to-close fix)
+    _js = """
+    (function() {
+      function wireTrashToClear() {
+        var sketch = document.getElementById("sketch-pad");
+        var clearBtn = document.getElementById("clear-drawing-btn");
+        if (!sketch || !clearBtn) return false;
+        var buttons = sketch.querySelectorAll("button");
+        for (var i = 0; i < buttons.length; i++) {
+          var btn = buttons[i];
+          var label = (btn.getAttribute("aria-label") || btn.getAttribute("title") || "").toLowerCase();
+          var testId = (btn.getAttribute("data-testid") || "").toLowerCase();
+          var isTrash = /clear|delete|trash|reset/.test(label) || /clear|delete|trash|reset/.test(testId);
+          if (isTrash && !btn.dataset.wiredToClear) {
+            btn.dataset.wiredToClear = "1";
+            btn.addEventListener("click", function() {
+              setTimeout(function() { clearBtn.click(); }, 50);
+            });
+          }
+        }
+        return true;
+      }
+      function closeBrushPopoverIfOpen(e) {
+        var sketch = document.getElementById("sketch-pad");
+        if (!sketch) return;
+        var target = e.target;
+        var expanded = sketch.querySelector('[aria-expanded="true"]');
+        if (!expanded) {
+          var openPopover = sketch.querySelector('[data-state="open"], .open, [aria-hidden="false"]');
+          if (openPopover && openPopover.closest && !openPopover.contains(target)) {
+            var trigger = sketch.querySelector('[aria-haspopup="true"], [data-popover-trigger]');
+            if (trigger) trigger.click();
+          }
+          return;
+        }
+        var popoverId = expanded.getAttribute("aria-controls");
+        var popover = popoverId ? document.getElementById(popoverId) : expanded.nextElementSibling;
+        var insidePopover = popover && popover.contains && popover.contains(target);
+        if (insidePopover) return;
+        var onTrigger = expanded.contains && expanded.contains(target);
+        if (onTrigger) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        expanded.click();
+      }
+      function setupBrushPopoverClose() {
+        var sketch = document.getElementById("sketch-pad");
+        if (!sketch || sketch.dataset.brushCloseWired) return;
+        sketch.dataset.brushCloseWired = "1";
+        ["touchstart", "touchend", "mousedown"].forEach(function(ev) {
+          document.addEventListener(ev, closeBrushPopoverIfOpen, true);
+        });
+      }
+      if (document.readyState === "complete") {
+        setTimeout(wireTrashToClear, 500);
+        setTimeout(setupBrushPopoverClose, 600);
+      } else {
+        window.addEventListener("load", function() {
+          setTimeout(wireTrashToClear, 500);
+          setTimeout(setupBrushPopoverClose, 600);
+        });
+      }
+      var check = setInterval(function() {
+        if (wireTrashToClear()) clearInterval(check);
+      }, 1000);
+      setTimeout(function() { clearInterval(check); }, 10000);
+      setInterval(setupBrushPopoverClose, 2000);
+    })();
+    """
+
     with gr.Blocks(
-        title="Sketch → Face (Canny / XDoG)",
+        title="Sketch ? Face (Canny / XDoG)",
         fill_width=True,
         head="<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        css=_css,
+        js=_js,
     ) as demo:
         gr.Markdown(
             """
-            # Sketch → Face
+            # Sketch ? Face
             Draw white edge strokes on the black canvas, then click **Generate**.
             """
         )
@@ -365,7 +480,8 @@ def build_demo(models: dict, default_steps: int):
                 label="CFG",
             )
             preset_btn = gr.Button("Max perceptual qual", variant="secondary")
-            clear_btn = gr.Button("Clear drawing", variant="secondary")
+            clear_btn = gr.Button("Clear drawing", variant="secondary", elem_id="clear-drawing-btn")
+            save_sketch_btn = gr.DownloadButton("Save my sketch (64?64)", variant="secondary")
             generate_btn = gr.Button("Generate face", variant="primary", size="lg")
         with gr.Accordion("Advanced", open=False):
             seed_slider = gr.Slider(
@@ -389,12 +505,14 @@ def build_demo(models: dict, default_steps: int):
                     colors=["#FFFFFF"],
                     color_mode="fixed",
                     default_color="#FFFFFF",
+                    default_size=2,
                 ),
                 value={
                     "background": black_bg,
                     "layers": [],
                     "composite": black_bg,
                 },
+                elem_id="sketch-pad",
             )
             output_image = gr.Image(
                 label="Generated face",
@@ -414,6 +532,11 @@ def build_demo(models: dict, default_steps: int):
             queue=False,
         )
         clear_btn.click(fn=clear_sketch, outputs=sketch_input)
+        save_sketch_btn.click(
+            fn=save_sketch_64x64,
+            inputs=sketch_input,
+            outputs=save_sketch_btn,
+        )
         generate_btn.click(
             fn=generate,
             inputs=[sketch_input, edge_radio, num_steps_slider, guidance_scale_slider, seed_slider],
@@ -424,7 +547,7 @@ def build_demo(models: dict, default_steps: int):
             gr.Markdown(
                 """
                 **Architecture:** UNet (6-ch input = 3-ch noisy image + 3-ch edge map)  |
-                **Method:** Flow Matching, Euler steps  |  **Models:** Canny, CelebA 64×64
+                **Method:** Flow Matching, Euler steps  |  **Models:** Baseline + Best Canny + XDoG, CelebA 64?64
                 """
             )
 
@@ -456,7 +579,7 @@ def main():
     print("To run the combined Canny/XDoG sketch-to-face demo, use:")
     print("  modal serve gradio_demo_combined.py")
     print("Then open the URL printed by Modal in your browser.")
-    print("Do not use 'modal run' — use 'modal serve'.")
+    print("Do not use 'modal run' ? use 'modal serve'.")
 
 
 @app.function(
@@ -469,7 +592,7 @@ def main():
 @modal.concurrent(max_inputs=10)
 @modal.asgi_app()
 def ui():
-    """Load both Canny and XDoG models (when available) and serve the combined Gradio demo."""
+    """Load baseline/Canny/XDoG variants (when available) and serve the combined Gradio demo."""
     import sys
     sys.path.insert(0, "/root")
 
@@ -480,17 +603,31 @@ def ui():
     print(f"[demo] Device: {device}")
 
     # Resolve and load each checkpoint (latest in known dirs, else discovery)
+    ckpt_baseline = find_latest_in_checkpoints_dir(DATA_DIR, BASELINE_CHECKPOINTS_DIR) or find_latest_checkpoint(
+        DATA_DIR, subdir_contains="edge_canny_flow_matching_modal_2gpu"
+    )
+    ckpt_baseline_bgaug = find_latest_in_checkpoints_dir(DATA_DIR, BASELINE_BGAUG_CHECKPOINTS_DIR) or find_latest_checkpoint(
+        DATA_DIR, subdir_contains="hw4_noadapter_canny_mix_eagf_geomaug_precomputedbg_modal_4gpu_fastfull"
+    )
     ckpt_canny = find_latest_in_checkpoints_dir(DATA_DIR, CANNY_CHECKPOINTS_DIR) or find_latest_checkpoint(
         DATA_DIR, subdir_contains="edge_canny"
     )
-    # XDoG commented out for now
-    # ckpt_xdog = find_latest_in_checkpoints_dir(DATA_DIR, XDOG_CHECKPOINTS_DIR) or find_latest_checkpoint(
-    #     DATA_DIR,
-    #     subdir_contains="edge_flow_matching",
-    #     subdir_excludes="edge_canny",
-    # )
+    ckpt_xdog = find_latest_in_checkpoints_dir(DATA_DIR, XDOG_CHECKPOINTS_DIR) or find_latest_checkpoint(
+        DATA_DIR,
+        subdir_contains="edge_xdog",
+        subdir_excludes="edge_canny",
+    )
+    ckpt_xdog_bgaug = find_latest_in_checkpoints_dir(DATA_DIR, XDOG_BGAUG_CHECKPOINTS_DIR) or find_latest_checkpoint(
+        DATA_DIR, subdir_contains="hw4_edge_adapter_xdog028_eagf_geomaug_precomputedbg_modal_2gpu"
+    )
 
-    if ckpt_canny is None:
+    if (
+        ckpt_baseline is None
+        and ckpt_baseline_bgaug is None
+        and ckpt_canny is None
+        and ckpt_xdog is None
+        and ckpt_xdog_bgaug is None
+    ):
         with gr.Blocks(title="No checkpoint found") as err_demo:
             gr.Markdown(
                 f"""
@@ -515,20 +652,41 @@ def ui():
     models = {}
     default_steps = 50
 
+    if ckpt_baseline:
+        method, image_shape, steps = load_model(ckpt_baseline, device)
+        models["baseline"] = (method, image_shape, steps)
+        default_steps = steps
+        print(f"[demo] Baseline model ready | image_shape={image_shape} | default_steps={steps}")
+
+    if ckpt_baseline_bgaug:
+        method, image_shape, steps = load_model(ckpt_baseline_bgaug, device)
+        models["baseline_bgaug"] = (method, image_shape, steps)
+        if "baseline" not in models:
+            default_steps = steps
+        print(f"[demo] baseline (+bg +aug) model ready | image_shape={image_shape} | default_steps={steps}")
+
     if ckpt_canny:
         method, image_shape, steps = load_model(ckpt_canny, device)
         models["canny"] = (method, image_shape, steps)
-        default_steps = steps
+        if "baseline" not in models and "baseline_bgaug" not in models:
+            default_steps = steps
         print(f"[demo] Canny model ready | image_shape={image_shape} | default_steps={steps}")
 
-    # XDoG commented out for now
-    # if ckpt_xdog:
-    #     method, image_shape, steps = load_model(ckpt_xdog, device)
-    #     models["xdog"] = (method, image_shape, steps)
-    #     if "canny" not in models:
-    #         default_steps = steps
-    #     print(f"[demo] XDoG model ready | image_shape={image_shape} | default_steps={steps}")
+    if ckpt_xdog:
+        method, image_shape, steps = load_model(ckpt_xdog, device)
+        models["xdog"] = (method, image_shape, steps)
+        if "baseline" not in models and "baseline_bgaug" not in models and "canny" not in models:
+            default_steps = steps
+        print(f"[demo] XDoG model ready | image_shape={image_shape} | default_steps={steps}")
+
+    if ckpt_xdog_bgaug:
+        method, image_shape, steps = load_model(ckpt_xdog_bgaug, device)
+        models["xdog_bgaug"] = (method, image_shape, steps)
+        if "baseline" not in models and "baseline_bgaug" not in models and "canny" not in models and "xdog" not in models:
+            default_steps = steps
+        print(f"[demo] xdog (+bg+aug) model ready | image_shape={image_shape} | default_steps={steps}")
 
     demo = build_demo(models, default_steps)
     fast_app = make_fastapi_app()
     return gr.mount_gradio_app(fast_app, demo, path="/")
+

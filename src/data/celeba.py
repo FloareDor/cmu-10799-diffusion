@@ -128,6 +128,16 @@ class CelebADataset(Dataset):
         edge_mix_canny_low: int = 80,
         edge_mix_canny_high: int = 200,
         edge_mix_alpha_per_method: Optional[List[float]] = None,
+        bg_remove_enabled: bool = False,
+        bg_remove_method: str = "rembg",
+        bg_remove_model: str = "u2netp",
+        bg_remove_prob: float = 0.0,
+        bg_remove_black_background: bool = True,
+        geom_aug_prob: float = 0.0,
+        geom_aug_degrees: float = 0.0,
+        geom_aug_translate: float = 0.0,
+        geom_aug_scale_min: float = 1.0,
+        geom_aug_scale_max: float = 1.0,
     ):
         self.root = root
         self.split = split
@@ -160,6 +170,17 @@ class CelebADataset(Dataset):
             if edge_mix_alpha_per_method is not None
             else None
         )
+        self.bg_remove_enabled = bool(bg_remove_enabled)
+        self.bg_remove_method = str(bg_remove_method).lower()
+        self.bg_remove_model = str(bg_remove_model)
+        self.bg_remove_prob = float(np.clip(bg_remove_prob, 0.0, 1.0))
+        self.bg_remove_black_background = bool(bg_remove_black_background)
+        self._bg_remove_session = None
+        self.geom_aug_prob = float(np.clip(geom_aug_prob, 0.0, 1.0))
+        self.geom_aug_degrees = abs(float(geom_aug_degrees))
+        self.geom_aug_translate = float(np.clip(geom_aug_translate, 0.0, 1.0))
+        self.geom_aug_scale_min = float(geom_aug_scale_min)
+        self.geom_aug_scale_max = float(geom_aug_scale_max)
         if self.edge_mix_alpha_per_method is not None:
             if len(self.edge_mix_alpha_per_method) != len(self.edge_mix_methods):
                 raise ValueError(
@@ -171,6 +192,12 @@ class CelebADataset(Dataset):
 
         if self.edge_mix_alpha <= 0:
             raise ValueError("edge_mix_alpha must be > 0.")
+        if self.bg_remove_enabled and self.bg_remove_method != "rembg":
+            raise ValueError("Only bg_remove_method='rembg' is currently supported.")
+        if self.geom_aug_scale_min <= 0 or self.geom_aug_scale_max <= 0:
+            raise ValueError("geom_aug_scale_min and geom_aug_scale_max must be > 0.")
+        if self.geom_aug_scale_min > self.geom_aug_scale_max:
+            raise ValueError("geom_aug_scale_min must be <= geom_aug_scale_max.")
 
         self.transform = self._build_transforms()
         self.base_transform = transforms.Compose(
@@ -373,6 +400,97 @@ class CelebADataset(Dataset):
         mix_u8 = _ensure_white_edges_on_black(mix_u8)
         return _gray_to_rgb_pil(mix_u8)
 
+    def _maybe_apply_joint_geometric_aug(
+        self, image: Image.Image, edge: Image.Image
+    ) -> Tuple[Image.Image, Image.Image]:
+        if not (self.augment and self.split == "train"):
+            return image, edge
+        if self.geom_aug_prob <= 0.0 or torch.rand(()) >= self.geom_aug_prob:
+            return image, edge
+
+        angle = 0.0
+        if self.geom_aug_degrees > 0.0:
+            angle = float(
+                torch.empty(1).uniform_(-self.geom_aug_degrees, self.geom_aug_degrees).item()
+            )
+
+        tx = 0
+        ty = 0
+        if self.geom_aug_translate > 0.0:
+            max_tx = int(round(self.geom_aug_translate * image.width))
+            max_ty = int(round(self.geom_aug_translate * image.height))
+            if max_tx > 0:
+                tx = int(torch.randint(-max_tx, max_tx + 1, (1,)).item())
+            if max_ty > 0:
+                ty = int(torch.randint(-max_ty, max_ty + 1, (1,)).item())
+
+        scale = 1.0
+        if self.geom_aug_scale_min != 1.0 or self.geom_aug_scale_max != 1.0:
+            scale = float(
+                torch.empty(1).uniform_(self.geom_aug_scale_min, self.geom_aug_scale_max).item()
+            )
+
+        if angle == 0.0 and tx == 0 and ty == 0 and scale == 1.0:
+            return image, edge
+
+        image = TF.affine(
+            image,
+            angle=angle,
+            translate=[tx, ty],
+            scale=scale,
+            shear=[0.0, 0.0],
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            fill=0,
+        )
+        edge = TF.affine(
+            edge,
+            angle=angle,
+            translate=[tx, ty],
+            scale=scale,
+            shear=[0.0, 0.0],
+            interpolation=transforms.InterpolationMode.NEAREST,
+            fill=0,
+        )
+        return image, edge
+
+    def _get_bg_remove_session(self):
+        if self._bg_remove_session is None:
+            try:
+                from rembg import new_session
+            except ImportError as exc:
+                raise ImportError(
+                    "Background removal requires rembg. Install with: pip install rembg onnxruntime"
+                ) from exc
+            self._bg_remove_session = new_session(self.bg_remove_model)
+        return self._bg_remove_session
+
+    def _maybe_remove_background(self, image: Image.Image) -> Image.Image:
+        if not self.bg_remove_enabled or self.bg_remove_prob <= 0.0:
+            return image
+        if self.split != "train":
+            return image
+        if torch.rand(()) >= self.bg_remove_prob:
+            return image
+
+        try:
+            from rembg import remove
+        except ImportError as exc:
+            raise ImportError(
+                "Background removal requires rembg. Install with: pip install rembg onnxruntime"
+            ) from exc
+
+        session = self._get_bg_remove_session()
+        rgba = remove(image.convert("RGB"), session=session).convert("RGBA")
+        rgba_arr = np.array(rgba, dtype=np.uint8)
+        rgb = rgba_arr[..., :3].astype(np.float32)
+        alpha = (rgba_arr[..., 3:4].astype(np.float32) / 255.0)
+        if self.bg_remove_black_background:
+            out = rgb * alpha
+        else:
+            out = rgb * alpha + (255.0 * (1.0 - alpha))
+        out = np.clip(out, 0.0, 255.0).astype(np.uint8)
+        return Image.fromarray(out, mode="RGB")
+
     def __len__(self) -> int:
         return len(self.data)
 
@@ -383,6 +501,7 @@ class CelebADataset(Dataset):
             image = item["image"].convert("RGB")
         else:
             image = Image.open(item["image"]).convert("RGB")
+        image = self._maybe_remove_background(image)
 
         if self.conditional:
             if self.edge_method == "mixed":
@@ -390,6 +509,7 @@ class CelebADataset(Dataset):
             else:
                 edge = self._single_edge(image, self.edge_method)
 
+            image, edge = self._maybe_apply_joint_geometric_aug(image, edge)
             if self.augment and self.split == "train" and torch.rand(()) < 0.5:
                 image = TF.hflip(image)
                 edge = TF.hflip(edge)
@@ -425,6 +545,16 @@ def create_dataloader(
     edge_mix_canny_low: int = 80,
     edge_mix_canny_high: int = 200,
     edge_mix_alpha_per_method: Optional[List[float]] = None,
+    bg_remove_enabled: bool = False,
+    bg_remove_method: str = "rembg",
+    bg_remove_model: str = "u2netp",
+    bg_remove_prob: float = 0.0,
+    bg_remove_black_background: bool = True,
+    geom_aug_prob: float = 0.0,
+    geom_aug_degrees: float = 0.0,
+    geom_aug_translate: float = 0.0,
+    geom_aug_scale_min: float = 1.0,
+    geom_aug_scale_max: float = 1.0,
 ) -> DataLoader:
     dataset = CelebADataset(
         root=root,
@@ -446,6 +576,16 @@ def create_dataloader(
         edge_mix_canny_low=edge_mix_canny_low,
         edge_mix_canny_high=edge_mix_canny_high,
         edge_mix_alpha_per_method=edge_mix_alpha_per_method,
+        bg_remove_enabled=bg_remove_enabled,
+        bg_remove_method=bg_remove_method,
+        bg_remove_model=bg_remove_model,
+        bg_remove_prob=bg_remove_prob,
+        bg_remove_black_background=bg_remove_black_background,
+        geom_aug_prob=geom_aug_prob,
+        geom_aug_degrees=geom_aug_degrees,
+        geom_aug_translate=geom_aug_translate,
+        geom_aug_scale_min=geom_aug_scale_min,
+        geom_aug_scale_max=geom_aug_scale_max,
     )
 
     if shuffle is None:
@@ -464,6 +604,9 @@ def create_dataloader(
 def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoader:
     data_config = config["data"]
     training_config = config["training"]
+    bg_remove_prob = float(data_config.get("bg_remove_prob", 0.0))
+    if split != "train":
+        bg_remove_prob = 0.0
 
     return create_dataloader(
         root=data_config.get("root", "./data/celeba-subset"),
@@ -488,6 +631,16 @@ def create_dataloader_from_config(config: dict, split: str = "train") -> DataLoa
         edge_mix_canny_low=int(data_config.get("edge_mix_canny_low", 80)),
         edge_mix_canny_high=int(data_config.get("edge_mix_canny_high", 200)),
         edge_mix_alpha_per_method=data_config.get("edge_mix_alpha_per_method", None),
+        bg_remove_enabled=bool(data_config.get("bg_remove_enabled", False)),
+        bg_remove_method=data_config.get("bg_remove_method", "rembg"),
+        bg_remove_model=data_config.get("bg_remove_model", "u2netp"),
+        bg_remove_prob=bg_remove_prob,
+        bg_remove_black_background=bool(data_config.get("bg_remove_black_background", True)),
+        geom_aug_prob=float(data_config.get("geom_aug_prob", 0.0)),
+        geom_aug_degrees=float(data_config.get("geom_aug_degrees", 0.0)),
+        geom_aug_translate=float(data_config.get("geom_aug_translate", 0.0)),
+        geom_aug_scale_min=float(data_config.get("geom_aug_scale_min", 1.0)),
+        geom_aug_scale_max=float(data_config.get("geom_aug_scale_max", 1.0)),
     )
 
 

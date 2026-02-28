@@ -34,6 +34,8 @@ image = (
         "tqdm>=4.64.0",
         "scipy>=1.9.0",
         "opencv-python-headless>=4.0.0",
+        "rembg>=2.0.0",
+        "onnxruntime>=1.16.0",
         "wandb>=0.15.0",
         "datasets>=2.0.0",  # For HuggingFace Hub dataset loading
         "torch-fidelity>=0.3.0",  # Comprehensive evaluation metrics
@@ -105,10 +107,16 @@ def _train_impl(
 
     # Set Modal-specific paths
     config['data']['repo_name'] = "electronickale/cmu-10799-celeba64-subset"
-    # Set root path for both modes:
-    # - from_hub=true: checks for cached Arrow format first, then downloads from HF
-    # - from_hub=false: looks for traditional folder structure (train/images/)
-    config['data']['root'] = "/data/celeba"
+    # Respect config-provided root. For relative paths, pin under /data volume.
+    configured_root = str(config['data'].get('root', 'celeba'))
+    if configured_root.startswith("/"):
+        modal_root = configured_root
+    else:
+        normalized = configured_root.lstrip("./")
+        if normalized.startswith("data/"):
+            normalized = normalized[5:]
+        modal_root = f"/data/{normalized}"
+    config['data']['root'] = modal_root
     config['checkpoint']['dir'] = f"/data/checkpoints/{config_tag}"
     config['logging']['dir'] = f"/data/logs/{config_tag}"
 
@@ -315,6 +323,61 @@ def sample(
     return f"Samples saved to {output_path}"
 
 
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=60 * 60 * 4,  # 4 hours
+    volumes={"/data": volume},
+)
+def generate_paired_triplet_strip(
+    baseline_checkpoint: str,
+    hw4_checkpoint: str,
+    output_path: str = "hw4_eval/poster/paired_triplet_strip_edge_base_hw4.png",
+    method: str = "flow_matching",
+    num_pairs: int = 3,
+    num_steps: int = 50,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
+    dataset_split: str = "train",
+    batch_size: int = 8,
+    seed: int = 42,
+    condition_source: str = "baseline",
+    layout: str = "triplet_rows",
+):
+    """
+    Generate paired triplets [edge | baseline | hw4] using identical edge inputs.
+    """
+    import os
+    import subprocess
+
+    base_ckpt = f"/data/{baseline_checkpoint}"
+    hw_ckpt = f"/data/{hw4_checkpoint}"
+    out_path = f"/data/{output_path}"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    cmd = [
+        "python",
+        "/root/scripts/generate_paired_triplet_strip.py",
+        "--baseline_checkpoint", base_ckpt,
+        "--hw4_checkpoint", hw_ckpt,
+        "--method", method,
+        "--num_pairs", str(num_pairs),
+        "--batch_size", str(batch_size),
+        "--num_steps", str(num_steps),
+        "--sampler", sampler,
+        "--eta", str(eta),
+        "--dataset_split", dataset_split,
+        "--seed", str(seed),
+        "--condition_source", condition_source,
+        "--layout", layout,
+        "--output_path", out_path,
+    ]
+
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    volume.commit()
+    return result.stdout.strip() if result.stdout else f"Saved to {out_path}"
+
+
 # =============================================================================
 # Dataset Download Function
 # =============================================================================
@@ -353,6 +416,212 @@ def download_dataset():
 
 
 # =============================================================================
+# Dataset Background-Removal Precompute (Parallel)
+# =============================================================================
+
+def _to_data_path(path: str) -> str:
+    if path.startswith("/data/"):
+        return path
+    return f"/data/{path.lstrip('/')}"
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60 * 6,  # 6 hours per shard
+    volumes={"/data": volume},
+)
+def precompute_bg_removed_shard(
+    source_root: str = "celeba",
+    output_root: str = "celeba_bg_removed_shards",
+    split: str = "train",
+    shard_idx: int = 0,
+    num_shards: int = 6,
+    model_name: str = "u2netp",
+):
+    import os
+    import shutil
+    import numpy as np
+    from PIL import Image
+    from datasets import load_from_disk
+    from rembg import remove, new_session
+
+    source_path = _to_data_path(source_root)
+    output_path = _to_data_path(output_root)
+    session = new_session(model_name)
+
+    if not os.path.exists(os.path.join(source_path, "dataset_dict.json")):
+        raise FileNotFoundError(
+            f"Source dataset not found at {source_path}. Run --action download first."
+        )
+
+    ds_dict = load_from_disk(source_path)
+    if split not in ds_dict:
+        raise ValueError(f"Split '{split}' not found in source dataset. Available: {list(ds_dict.keys())}")
+
+    split_ds = ds_dict[split]
+    shard = split_ds.shard(num_shards=num_shards, index=shard_idx, contiguous=False)
+
+    print(f"[bg-shard] split={split} shard={shard_idx+1}/{num_shards} count={len(shard)}")
+
+    def _remove_bg(example):
+        image = example["image"].convert("RGB")
+        rgba = remove(image, session=session).convert("RGBA")
+        rgba_arr = np.array(rgba, dtype=np.uint8)
+        rgb = rgba_arr[..., :3].astype(np.float32)
+        alpha = (rgba_arr[..., 3:4].astype(np.float32) / 255.0)
+        out = np.clip(rgb * alpha, 0.0, 255.0).astype(np.uint8)
+        example["image"] = Image.fromarray(out, mode="RGB")
+        return example
+
+    processed = shard.map(_remove_bg, desc=f"BG remove {split} shard {shard_idx}")
+
+    shard_path = os.path.join(output_path, f"{split}_shard_{shard_idx:02d}")
+    if os.path.exists(shard_path):
+        shutil.rmtree(shard_path)
+    processed.save_to_disk(shard_path)
+    volume.commit()
+
+    return {"split": split, "shard_idx": shard_idx, "count": len(processed), "path": shard_path}
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60 * 24,  # 24 hours orchestration
+    volumes={"/data": volume},
+)
+def precompute_bg_removed_dataset_parallel(
+    source_root: str = "celeba",
+    output_root: str = "celeba_bg_removed",
+    model_name: str = "u2netp",
+    num_shards: int = 6,
+    splits: str = "train,validation",
+):
+    import os
+    import shutil
+    from datasets import load_from_disk, DatasetDict, concatenate_datasets
+
+    source_path = _to_data_path(source_root)
+    output_path = _to_data_path(output_root)
+    shard_root = f"{output_path}_shards"
+
+    if num_shards < 1:
+        raise ValueError("num_shards must be >= 1")
+    if not os.path.exists(os.path.join(source_path, "dataset_dict.json")):
+        raise FileNotFoundError(
+            f"Source dataset not found at {source_path}. Run --action download first."
+        )
+
+    source_ds = load_from_disk(source_path)
+    requested_splits = [s.strip() for s in splits.split(",") if s.strip()]
+    split_names = [s for s in requested_splits if s in source_ds]
+    if not split_names:
+        raise ValueError(
+            f"No valid splits requested. Requested={requested_splits}, available={list(source_ds.keys())}"
+        )
+
+    if os.path.exists(shard_root):
+        shutil.rmtree(shard_root)
+    os.makedirs(shard_root, exist_ok=True)
+
+    # Launch shards in parallel.
+    handles = []
+    for split in split_names:
+        for shard_idx in range(num_shards):
+            handle = precompute_bg_removed_shard.spawn(
+                source_root=source_path,
+                output_root=shard_root,
+                split=split,
+                shard_idx=shard_idx,
+                num_shards=num_shards,
+                model_name=model_name,
+            )
+            handles.append((split, shard_idx, handle))
+
+    for split, shard_idx, handle in handles:
+        result = handle.get()
+        print(f"[bg-done] split={split} shard={shard_idx} count={result['count']}")
+
+    # Merge split shards into one DatasetDict and save.
+    merged = {}
+    for split in split_names:
+        split_shards = []
+        for shard_idx in range(num_shards):
+            shard_path = os.path.join(shard_root, f"{split}_shard_{shard_idx:02d}")
+            split_shards.append(load_from_disk(shard_path))
+        merged[split] = concatenate_datasets(split_shards)
+
+    final_ds = DatasetDict(merged)
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
+    final_ds.save_to_disk(output_path)
+
+    # Keep only the merged dataset.
+    shutil.rmtree(shard_root, ignore_errors=True)
+    volume.commit()
+
+    counts = {split: len(final_ds[split]) for split in split_names}
+    return f"Background-removed dataset saved to {output_path} with splits: {counts}"
+
+
+@app.function(
+    image=image,
+    timeout=60 * 60 * 2,  # merge only
+    volumes={"/data": volume},
+)
+def merge_bg_removed_from_shards(
+    shard_root: str = "celeba_bg_removed_shards",
+    output_root: str = "celeba_bg_removed",
+    cleanup_shards: bool = False,
+):
+    import os
+    import re
+    import shutil
+    from collections import defaultdict
+    from datasets import load_from_disk, DatasetDict, concatenate_datasets
+
+    shard_path_root = _to_data_path(shard_root)
+    output_path = _to_data_path(output_root)
+
+    if not os.path.isdir(shard_path_root):
+        raise FileNotFoundError(f"Shard root not found: {shard_path_root}")
+
+    # Discover shard directories like: train_shard_00
+    split_shards = defaultdict(list)
+    pat = re.compile(r"^(.+)_shard_(\d+)$")
+    for entry in os.listdir(shard_path_root):
+        full = os.path.join(shard_path_root, entry)
+        if not os.path.isdir(full):
+            continue
+        m = pat.match(entry)
+        if not m:
+            continue
+        split_name, shard_idx = m.group(1), int(m.group(2))
+        split_shards[split_name].append((shard_idx, full))
+
+    if not split_shards:
+        raise RuntimeError(f"No shard directories found under {shard_path_root}")
+
+    merged = {}
+    for split_name, shard_infos in split_shards.items():
+        shard_infos.sort(key=lambda x: x[0])
+        parts = [load_from_disk(p) for _, p in shard_infos]
+        merged[split_name] = concatenate_datasets(parts)
+        print(f"[merge] split={split_name} parts={len(parts)} rows={len(merged[split_name])}")
+
+    final_ds = DatasetDict(merged)
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
+    final_ds.save_to_disk(output_path)
+
+    if cleanup_shards:
+        shutil.rmtree(shard_path_root, ignore_errors=True)
+
+    volume.commit()
+    counts = {split: len(final_ds[split]) for split in final_ds.keys()}
+    return f"Merged background-removed dataset at {output_path} with splits: {counts}"
+
+
+# =============================================================================
 # Evaluation Function (using torch-fidelity)
 # =============================================================================
 
@@ -371,6 +640,7 @@ def evaluate_torch_fidelity(
     num_steps: int = None,
     sampler: str = "ddpm",
     eta: float = 0.0,
+    edge_source: str = None,
     override: bool = False,
     save_log_path: str = None,
 ):
@@ -388,6 +658,8 @@ def evaluate_torch_fidelity(
         num_steps: Sampling steps (optional)
         sampler: Sampling method for DDPM ('ddpm' or 'ddim')
         eta: Eta parameter for DDIM sampling
+        edge_source: Optional conditioning source for conditional models.
+                     Use "dataset" to draw conditions from the training split.
         override: Force regenerate samples even if they exist
         save_log_path: Optional path to save results log file (relative to /data)
     """
@@ -494,6 +766,8 @@ def evaluate_torch_fidelity(
 
         if num_steps:
             sample_cmd.extend(["--num_steps", str(num_steps)])
+        if edge_source is not None:
+            sample_cmd.extend(["--edge_source", edge_source])
 
         subprocess.run(sample_cmd, check=True)
         print(f"Generated {num_samples} samples to {generated_dir}")
@@ -558,6 +832,240 @@ def evaluate_torch_fidelity(
         raise
 
 
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=60 * 60 * 8,  # 8 hours
+    volumes={"/data": volume},
+)
+def evaluate_controllability(
+    method: str = "flow_matching",
+    checkpoint: str = "checkpoints/ddpm/ddpm_final.pt",
+    num_samples: int = 1000,
+    batch_size: int = 64,
+    num_steps: int = None,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
+    edge_source: str = "dataset",
+    edge_split: str = "train",
+    eval_edge_method: str = "canny",
+    mask_threshold: float = 0.5,
+    tolerance_px: int = 1,
+    canny_sigma: float = 1.2,
+    canny_low: int = 80,
+    canny_high: int = 200,
+    xdog_sigma: float = 0.29,
+    seed: int = 42,
+    save_log_path: str = None,
+):
+    """
+    Evaluate conditional controllability via edge adherence metrics.
+
+    Produces JSON with:
+    - edge_adherence_iou_mean/std
+    - edge_precision_mean/std
+    - edge_recall_mean/std
+    - edge_f1_mean/std
+    """
+    import json
+    import os
+    import subprocess
+
+    checkpoint_path = f"/data/{checkpoint}"
+
+    cmd = [
+        "python",
+        "/root/scripts/evaluate_controllability.py",
+        "--checkpoint", checkpoint_path,
+        "--method", method,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--sampler", sampler,
+        "--eta", str(eta),
+        "--edge_source", edge_source,
+        "--edge_split", edge_split,
+        "--eval_edge_method", eval_edge_method,
+        "--mask_threshold", str(mask_threshold),
+        "--tolerance_px", str(tolerance_px),
+        "--canny_sigma", str(canny_sigma),
+        "--canny_low", str(canny_low),
+        "--canny_high", str(canny_high),
+        "--xdog_sigma", str(xdog_sigma),
+        "--seed", str(seed),
+    ]
+    if num_steps is not None:
+        cmd.extend(["--num_steps", str(num_steps)])
+    if save_log_path is not None:
+        log_path = f"/data/{save_log_path}"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        cmd.extend(["--save_log_path", log_path])
+
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    stdout = result.stdout.strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(stdout)
+    except Exception:
+        pass
+
+    if save_log_path is not None and parsed is None:
+        # Fallback if script stdout includes non-JSON lines.
+        log_path = f"/data/{save_log_path}"
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(stdout)
+
+    volume.commit()
+    return stdout
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=60 * 60 * 8,  # 8 hours
+    volumes={"/data": volume},
+)
+def evaluate_csg(
+    method: str = "flow_matching",
+    checkpoint: str = "checkpoints/ddpm/ddpm_final.pt",
+    num_samples: int = 1000,
+    batch_size: int = 64,
+    num_steps: int = None,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
+    edge_source: str = "dataset",
+    edge_split: str = "train",
+    eval_edge_method: str = "canny",
+    mask_threshold: float = 0.5,
+    tolerance_px: int = 1,
+    canny_sigma: float = 1.2,
+    canny_low: int = 80,
+    canny_high: int = 200,
+    xdog_sigma: float = 0.29,
+    seed: int = 42,
+    save_log_path: str = None,
+):
+    """
+    Evaluate Condition Sensitivity Gap (CSG):
+    CSG = EAS_IoU(matched condition) - EAS_IoU(mismatched condition)
+    """
+    import json
+    import os
+    import subprocess
+
+    checkpoint_path = f"/data/{checkpoint}"
+
+    cmd = [
+        "python",
+        "/root/scripts/evaluate_csg.py",
+        "--checkpoint", checkpoint_path,
+        "--method", method,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--sampler", sampler,
+        "--eta", str(eta),
+        "--edge_source", edge_source,
+        "--edge_split", edge_split,
+        "--eval_edge_method", eval_edge_method,
+        "--mask_threshold", str(mask_threshold),
+        "--tolerance_px", str(tolerance_px),
+        "--canny_sigma", str(canny_sigma),
+        "--canny_low", str(canny_low),
+        "--canny_high", str(canny_high),
+        "--xdog_sigma", str(xdog_sigma),
+        "--seed", str(seed),
+    ]
+    if num_steps is not None:
+        cmd.extend(["--num_steps", str(num_steps)])
+    if save_log_path is not None:
+        log_path = f"/data/{save_log_path}"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        cmd.extend(["--save_log_path", log_path])
+
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    stdout = result.stdout.strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(stdout)
+    except Exception:
+        pass
+
+    if save_log_path is not None and parsed is None:
+        log_path = f"/data/{save_log_path}"
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(stdout)
+
+    volume.commit()
+    return stdout
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=60 * 60 * 8,  # 8 hours
+    volumes={"/data": volume},
+)
+def evaluate_lpips_reference(
+    method: str = "flow_matching",
+    checkpoint: str = "checkpoints/ddpm/ddpm_final.pt",
+    num_samples: int = 1000,
+    batch_size: int = 64,
+    num_steps: int = None,
+    sampler: str = "ddpm",
+    eta: float = 0.0,
+    edge_source: str = "dataset",
+    edge_split: str = "train",
+    seed: int = 42,
+    save_log_path: str = None,
+):
+    """
+    Evaluate LPIPS to reference source images for the same conditioning edges.
+    Lower is better.
+    """
+    import json
+    import os
+    import subprocess
+
+    checkpoint_path = f"/data/{checkpoint}"
+    cmd = [
+        "python",
+        "/root/scripts/evaluate_lpips_reference.py",
+        "--checkpoint", checkpoint_path,
+        "--method", method,
+        "--num_samples", str(num_samples),
+        "--batch_size", str(batch_size),
+        "--sampler", sampler,
+        "--eta", str(eta),
+        "--edge_source", edge_source,
+        "--edge_split", edge_split,
+        "--seed", str(seed),
+    ]
+    if num_steps is not None:
+        cmd.extend(["--num_steps", str(num_steps)])
+    if save_log_path is not None:
+        log_path = f"/data/{save_log_path}"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        cmd.extend(["--save_log_path", log_path])
+
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    stdout = result.stdout.strip()
+
+    parsed = None
+    try:
+        parsed = json.loads(stdout)
+    except Exception:
+        pass
+
+    if save_log_path is not None and parsed is None:
+        log_path = f"/data/{save_log_path}"
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(stdout)
+
+    volume.commit()
+    return stdout
+
+
 # =============================================================================
 # Helper Functions for Logging
 # =============================================================================
@@ -607,11 +1115,26 @@ def main(
     sampler: str = "ddpm",
     eta: float = 0.0,
     edge_source: str = None,
+    edge_split: str = "train",
+    eval_edge_method: str = "canny",
+    mask_threshold: float = 0.5,
+    tolerance_px: int = 1,
+    canny_sigma: float = 1.2,
+    canny_low: int = 80,
+    canny_high: int = 200,
+    xdog_sigma: float = 0.29,
+    seed: int = 42,
     save_path: str = None,
     metrics: str = None,
     save_log_path: str = None,
     overfit_single_batch: bool = False,
     override: bool = False,
+    bg_source_root: str = "celeba",
+    bg_output_root: str = "celeba_bg_removed",
+    bg_shard_root: str = "celeba_bg_removed_shards",
+    bg_model: str = "u2netp",
+    bg_num_shards: int = 6,
+    bg_splits: str = "train,validation",
 ):
     """
     Main entry point for Modal CLI.
@@ -622,6 +1145,22 @@ def main(
     """
     if action == "download":
         result = download_dataset.remote()
+        print(result)
+    elif action == "precompute_bg_removed":
+        result = precompute_bg_removed_dataset_parallel.remote(
+            source_root=bg_source_root,
+            output_root=bg_output_root,
+            model_name=bg_model,
+            num_shards=bg_num_shards,
+            splits=bg_splits,
+        )
+        print(result)
+    elif action == "merge_bg_removed":
+        result = merge_bg_removed_from_shards.remote(
+            shard_root=bg_shard_root,
+            output_root=bg_output_root,
+            cleanup_shards=False,
+        )
         print(result)
     elif action == "train":
         # Read config to determine GPU count
@@ -701,12 +1240,94 @@ def main(
             eval_kwargs['eta'] = eta
         if save_log_path is not None:
             eval_kwargs['save_log_path'] = save_log_path
+        if edge_source is not None:
+            eval_kwargs['edge_source'] = edge_source
 
         result = evaluate_torch_fidelity.remote(**eval_kwargs)
         print(result)
+    elif action == "evaluate_controllability":
+        if checkpoint is None:
+            checkpoint = f"checkpoints/{method}/{method}_final.pt"
+
+        controllability_kwargs = {
+            'method': method,
+            'checkpoint': checkpoint,
+            'num_samples': num_samples if num_samples is not None else 1000,
+            'batch_size': batch_size if batch_size is not None else 64,
+            'sampler': sampler,
+            'eta': eta,
+            'edge_source': edge_source if edge_source is not None else "dataset",
+            'edge_split': edge_split,
+            'eval_edge_method': eval_edge_method,
+            'mask_threshold': mask_threshold,
+            'tolerance_px': tolerance_px,
+            'canny_sigma': canny_sigma,
+            'canny_low': canny_low,
+            'canny_high': canny_high,
+            'xdog_sigma': xdog_sigma,
+            'seed': seed,
+        }
+        if num_steps is not None:
+            controllability_kwargs['num_steps'] = num_steps
+        if save_log_path is not None:
+            controllability_kwargs['save_log_path'] = save_log_path
+
+        result = evaluate_controllability.remote(**controllability_kwargs)
+        print(result)
+    elif action == "evaluate_csg":
+        if checkpoint is None:
+            checkpoint = f"checkpoints/{method}/{method}_final.pt"
+
+        csg_kwargs = {
+            'method': method,
+            'checkpoint': checkpoint,
+            'num_samples': num_samples if num_samples is not None else 1000,
+            'batch_size': batch_size if batch_size is not None else 64,
+            'sampler': sampler,
+            'eta': eta,
+            'edge_source': edge_source if edge_source is not None else "dataset",
+            'edge_split': edge_split,
+            'eval_edge_method': eval_edge_method,
+            'mask_threshold': mask_threshold,
+            'tolerance_px': tolerance_px,
+            'canny_sigma': canny_sigma,
+            'canny_low': canny_low,
+            'canny_high': canny_high,
+            'xdog_sigma': xdog_sigma,
+            'seed': seed,
+        }
+        if num_steps is not None:
+            csg_kwargs['num_steps'] = num_steps
+        if save_log_path is not None:
+            csg_kwargs['save_log_path'] = save_log_path
+
+        result = evaluate_csg.remote(**csg_kwargs)
+        print(result)
+    elif action == "evaluate_lpips_reference":
+        if checkpoint is None:
+            checkpoint = f"checkpoints/{method}/{method}_final.pt"
+
+        lpips_kwargs = {
+            'method': method,
+            'checkpoint': checkpoint,
+            'num_samples': num_samples if num_samples is not None else 1000,
+            'batch_size': batch_size if batch_size is not None else 64,
+            'sampler': sampler,
+            'eta': eta,
+            'edge_source': edge_source if edge_source is not None else "dataset",
+            'edge_split': edge_split,
+            'seed': seed,
+        }
+        if num_steps is not None:
+            lpips_kwargs['num_steps'] = num_steps
+        if save_log_path is not None:
+            lpips_kwargs['save_log_path'] = save_log_path
+
+        result = evaluate_lpips_reference.remote(**lpips_kwargs)
+        print(result)
     else:
         print(f"Unknown action: {action}")
-        print("Valid actions: download, train, sample, evaluate")
+        print("Valid actions: download, precompute_bg_removed, merge_bg_removed, train, sample, evaluate, evaluate_controllability, evaluate_csg, evaluate_lpips_reference")
 
 
 @app.local_entrypoint()
